@@ -103,8 +103,8 @@ fn main() {
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
     let lk_files = csv_files(&data.join("links"));
-    const CH: usize = 2 << 20;
-    let lk_chunks = chunks(&lk_files, CH);
+    let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20);
+    let lk_chunks = chunks(&lk_files, ch);
 
     // size the link table from the number of lines
     let next = AtomicUsize::new(0);
@@ -152,8 +152,8 @@ fn main() {
 
     lap("links flattened");
     // phase B: parse events and clicks
-    let ev_chunks = chunks(&ev_files, CH);
-    let ck_chunks = chunks(&ck_files, CH);
+    let ev_chunks = chunks(&ev_files, ch);
+    let ck_chunks = chunks(&ck_files, ch);
     let est = |files: &[&'static [u8]]| -> usize {
         // events or clicks per thread, from the average line length of the first non-empty file
         let total: usize = files.iter().map(|f| f.len()).sum();
