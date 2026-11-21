@@ -190,10 +190,10 @@ pub fn click_line(line: &'static [u8], f: &Fields<4>, uh: u64, cx: &Cx, out: &mu
 }
 
 #[inline(always)]
-pub fn link_line(line: &'static [u8], f: &Fields<2>, cx: &Cx) {
+pub fn link_line(line: &'static [u8], f: &Fields<2>, cx: &Cx, fresh: &mut Vec<u32>) {
     let (a, b) = (&line[f[0].0 as usize..f[0].1 as usize], &line[f[1].0 as usize..f[1].1 as usize]);
     if a.is_empty() || b.is_empty() {
         return;
     }
-    cx.links.add(a, b);
+    cx.links.add(a, b, fresh);
 }

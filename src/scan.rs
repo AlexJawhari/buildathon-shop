@@ -124,18 +124,20 @@ unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Opti
 
 #[inline(always)]
 unsafe fn strip_quotes<const NF: usize>(p: *const u8, f: &mut Fields<NF>, nq: u32) -> bool {
-    let mut quoted = 0;
+    // branch-free: which fields start with a quote is random, so a branch per field mispredicts
+    let mut quoted = 0u32;
+    let mut bad = false;
     for x in f.iter_mut() {
-        if x.1 > x.0 && *p.add(x.0 as usize) == b'"' {
-            quoted += 1;
-            if x.1 - x.0 < 2 || *p.add(x.1 as usize - 1) != b'"' {
-                return false;
-            }
-            x.0 += 1;
-            x.1 -= 1;
-        }
+        let (s, e) = (x.0, x.1);
+        let q = e > s && *p.add(s as usize) == b'"';
+        let li = if q { e - 1 } else { s };
+        let last = *p.add(li as usize);
+        bad |= q & ((e - s < 2) | (last != b'"'));
+        quoted += q as u32;
+        x.0 = s + q as u32;
+        x.1 = e - q as u32;
     }
-    nq == 2 * quoted
+    !bad && nq == 2 * quoted
 }
 
 /// Lines with no newline in 128 bytes: find it the slow way (or take the rest of the data).

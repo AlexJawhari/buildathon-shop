@@ -366,7 +366,7 @@ pub fn unmap_inputs(t: usize, parts: usize) {
         while off < len {
             let n = SEG.min(len - off);
             if k % parts == t {
-                unsafe { libc::munmap((p + off) as *mut _, n) };
+                unsafe { libc::madvise((p + off) as *mut _, n, libc::MADV_DONTNEED) };
             }
             k += 1;
             off += n;
@@ -560,7 +560,7 @@ impl Input {
 }
 
 /// Default input method. pread avoids page-table walks on VMs but costs a copy; measured slower on bare metal.
-const DEFAULT_READ_IO: bool = true;
+const DEFAULT_READ_IO: bool = false;
 
 /// True when events and clicks should be read with pread into per-thread buffers instead of mmap.
 /// `SHOP_IO=read|mmap` overrides DEFAULT_READ_IO.
