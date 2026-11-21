@@ -23,6 +23,7 @@ struct Sess {
 }
 
 pub struct State {
+    pub ws: i64,
     pub dbase: i64,
     pub nday: usize,
     pub organic: u32,
@@ -34,11 +35,39 @@ pub struct State {
     touched: Vec<u32>,
     cat_sum: Vec<u64>,
     cat_touched: Vec<u16>,
+    // per-bucket scratch
+    table: Vec<u32>,
+    pkeys: Vec<u64>,
+    cnt: Vec<u32>,
+    recs: Vec<(u32, PRec)>,
+    sorted: Vec<PRec>,
+    crecs: Vec<(u32, CRec)>,
+    csorted: Vec<CRec>,
+}
+
+/// Read-only view of a vector another thread filled.
+#[derive(Clone, Copy)]
+pub struct View<T>(pub *const T, pub usize);
+unsafe impl<T> Send for View<T> {}
+unsafe impl<T> Sync for View<T> {}
+impl<T> View<T> {
+    pub fn of(v: &Vec<T>) -> Self {
+        View(v.as_ptr(), v.len())
+    }
+    pub fn get(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.0, self.1) }
+    }
+}
+
+#[inline(always)]
+fn slot(pkey: u64, mask: usize) -> usize {
+    ((pkey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize) & mask
 }
 
 impl State {
-    pub fn new(dbase: i64, nday: usize, ncamp: usize, ncat: usize) -> State {
+    pub fn new(ws: i64, dbase: i64, nday: usize, ncamp: usize, ncat: usize) -> State {
         State {
+            ws,
             dbase,
             nday,
             organic: ncamp as u32,
@@ -50,30 +79,123 @@ impl State {
             touched: vec![],
             cat_sum: vec![0; ncat],
             cat_touched: vec![],
+            table: vec![],
+            pkeys: vec![],
+            cnt: vec![],
+            recs: vec![],
+            sorted: vec![],
+            crecs: vec![],
+            csorted: vec![],
         }
     }
 
-    pub fn bucket(&mut self, evs: &mut [PRec], cks: &mut [CRec]) {
-        evs.sort_unstable_by_key(|r| (r.pkey, r.ts));
-        cks.sort_unstable_by_key(|r| (r.pkey, r.ts));
-        let (mut i, mut c) = (0, 0);
-        while i < evs.len() {
-            let pk = evs[i].pkey;
-            let mut j = i + 1;
-            while j < evs.len() && evs[j].pkey == pk {
-                j += 1;
+    fn grow(&mut self) {
+        let cap = (self.table.len() * 2).max(4096);
+        self.table.clear();
+        self.table.resize(cap, 0);
+        for (id, &k) in self.pkeys.iter().enumerate() {
+            let mut s = slot(k, cap - 1);
+            while self.table[s] != 0 {
+                s = (s + 1) & (cap - 1);
             }
-            while c < cks.len() && cks[c].pkey < pk {
-                c += 1;
-            }
-            let mut d = c;
-            while d < cks.len() && cks[d].pkey == pk {
-                d += 1;
-            }
-            self.person(&evs[i..j], &cks[c..d]);
-            i = j;
-            c = d;
+            self.table[s] = id as u32 + 1;
         }
+    }
+
+    /// Group one person bucket's events and clicks per person and process each person.
+    pub fn bucket(&mut self, pvs: &[View<PRec>], cks: &[View<CRec>]) {
+        self.pkeys.clear();
+        self.cnt.clear();
+        self.recs.clear();
+        self.table.clear();
+        self.table.resize(4096, 0);
+        for v in pvs {
+            for r in v.get() {
+                if r.pc == DEAD {
+                    continue;
+                }
+                if self.pkeys.len() * 2 >= self.table.len() {
+                    self.grow();
+                }
+                let mask = self.table.len() - 1;
+                let mut s = slot(r.pkey, mask);
+                let id = loop {
+                    let e = self.table[s];
+                    if e == 0 {
+                        let id = self.pkeys.len() as u32;
+                        self.pkeys.push(r.pkey);
+                        self.cnt.push(0);
+                        self.table[s] = id + 1;
+                        break id;
+                    }
+                    if self.pkeys[e as usize - 1] == r.pkey {
+                        break e - 1;
+                    }
+                    s = (s + 1) & mask;
+                };
+                self.cnt[id as usize] += 1;
+                self.recs.push((id, *r));
+            }
+        }
+        let np = self.pkeys.len();
+        if np == 0 {
+            return;
+        }
+        // counting sort by person id
+        let mut off = vec![0u32; np + 1];
+        for i in 0..np {
+            off[i + 1] = off[i] + self.cnt[i];
+        }
+        let mut pos = off.clone();
+        self.sorted.clear();
+        self.sorted.resize(self.recs.len(), PRec { pkey: 0, uptr: 0, ts: 0, pc: 0 });
+        for &(id, r) in &self.recs {
+            self.sorted[pos[id as usize] as usize] = r;
+            pos[id as usize] += 1;
+        }
+        // clicks of persons that have events
+        self.crecs.clear();
+        let mut ccnt = vec![0u32; np + 1];
+        let mask = self.table.len() - 1;
+        for v in cks {
+            for c in v.get() {
+                let mut s = slot(c.pkey, mask);
+                loop {
+                    let e = self.table[s];
+                    if e == 0 {
+                        break;
+                    }
+                    if self.pkeys[e as usize - 1] == c.pkey {
+                        ccnt[e as usize - 1] += 1;
+                        self.crecs.push((e - 1, *c));
+                        break;
+                    }
+                    s = (s + 1) & mask;
+                }
+            }
+        }
+        let mut coff = vec![0u32; np + 1];
+        for i in 0..np {
+            coff[i + 1] = coff[i] + ccnt[i];
+        }
+        let mut cpos = coff.clone();
+        self.csorted.clear();
+        self.csorted.resize(self.crecs.len(), CRec { pkey: 0, cid: 0, ts: 0, camp: 0 });
+        for &(id, c) in &self.crecs {
+            self.csorted[cpos[id as usize] as usize] = c;
+            cpos[id as usize] += 1;
+        }
+        let mut sorted = std::mem::take(&mut self.sorted);
+        let mut csorted = std::mem::take(&mut self.csorted);
+        for id in 0..np {
+            let evs = &mut sorted[off[id] as usize..off[id + 1] as usize];
+            let cks = &mut csorted[coff[id] as usize..coff[id + 1] as usize];
+            evs.sort_unstable_by_key(|r| r.ts);
+            cks.sort_unstable_by_key(|r| r.ts);
+            self.person(evs, cks);
+        }
+        self.sorted = sorted;
+        self.csorted = csorted;
     }
 
     fn flush_day(&mut self, name: u64, day: i32, sessions: u32, events: u32, rev: u64) {
@@ -97,14 +219,16 @@ impl State {
 
     fn person(&mut self, evs: &[PRec], cks: &[CRec]) {
         let nday = self.nday;
+        let ws = self.ws;
+        let cbase = ws - WEEK_MS;
         let name = if evs[0].pkey >> 63 == 1 { evs[0].pkey & !(1 << 63) } else { evs[0].uptr };
         self.sess.clear();
-        // user-day accumulator
         let (mut uday, mut us, mut ue, mut ur) = (-1i32, 0u32, 0u32, 0u64);
-        let mut prev = i64::MIN;
+        let mut prev = u32::MAX;
         for e in evs {
-            if prev == i64::MIN || e.ts - prev > GAP_MS {
-                let day = (e.ts.div_euclid(DAY_MS) - self.dbase) as i32;
+            if prev == u32::MAX || (e.ts - prev) as i64 > GAP_MS {
+                let start = ws + e.ts as i64;
+                let day = (start.div_euclid(DAY_MS) - self.dbase) as i32;
                 if day != uday {
                     if uday >= 0 {
                         self.flush_day(name, (uday as i64 + self.dbase) as i32, us, ue, ur);
@@ -115,20 +239,21 @@ impl State {
                     ur = 0;
                 }
                 us += 1;
-                self.sess.push(Sess { start: e.ts, day: day as u32, rev: 0, purch: false });
+                self.sess.push(Sess { start, day: day as u32, rev: 0, purch: false });
             }
             prev = e.ts;
             ue += 1;
-            if e.ty == 2 {
-                ur += e.price as u64;
+            if e.ty() == 2 {
+                let price = e.price();
+                ur += price;
                 let s = self.sess.last_mut().unwrap();
-                s.rev += e.price as u64;
+                s.rev += price;
                 s.purch = true;
-                let k = e.cat as usize;
+                let k = e.cat() as usize;
                 if self.cat_sum[k] == 0 {
-                    self.cat_touched.push(e.cat);
+                    self.cat_touched.push(e.cat());
                 }
-                self.cat_sum[k] += e.price as u64;
+                self.cat_sum[k] += price;
             }
         }
         self.flush_day(name, (uday as i64 + self.dbase) as i32, us, ue, ur);
@@ -136,11 +261,11 @@ impl State {
         // credit
         let mut ci = 0;
         for s in &self.sess {
-            while ci < cks.len() && cks[ci].ts <= s.start {
+            while ci < cks.len() && cbase + cks[ci].ts as i64 <= s.start {
                 ci += 1;
             }
             let mut camp = self.organic;
-            if ci > 0 && s.start - cks[ci - 1].ts <= WEEK_MS {
+            if ci > 0 && s.start - (cbase + cks[ci - 1].ts as i64) <= WEEK_MS {
                 let cts = cks[ci - 1].ts;
                 let mut best = ci - 1;
                 let mut j = ci - 1;
@@ -172,10 +297,11 @@ impl State {
         }
         let (mut lo, mut hi) = (0usize, 0usize);
         for c in cks {
-            while lo < n && self.sess[lo].start < c.ts {
+            let cts = cbase + c.ts as i64;
+            while lo < n && self.sess[lo].start < cts {
                 lo += 1;
             }
-            while hi < n && self.sess[hi].start <= c.ts + WEEK_MS {
+            while hi < n && self.sess[hi].start <= cts + WEEK_MS {
                 hi += 1;
             }
             let k = c.camp as usize;
