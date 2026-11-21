@@ -129,7 +129,7 @@ impl Local {
 }
 
 #[inline(always)]
-pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) {
+pub fn event_line(line: &'static [u8], f: &Fields<7>, uh: u64, cx: &Cx, out: &mut Local) {
     let fl = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let id = fl(0);
     if id.is_empty() {
@@ -163,7 +163,7 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) 
             let Some(p) = parse_price(fl(6)) else { break 'v };
             pc |= p | (cx.prods.get(hash(prod)).unwrap_or(cx.unknown_cat) << 26);
         }
-        let pkey = cx.links.person(hash(user));
+        let pkey = cx.links.person(uh);
         let b = bucket(pkey);
         let i = out.pv[b].len();
         assert!(i < 1 << 24);
@@ -174,7 +174,7 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) 
 }
 
 #[inline(always)]
-pub fn click_line(line: &'static [u8], f: &Fields<4>, cx: &Cx, out: &mut Local) {
+pub fn click_line(line: &'static [u8], f: &Fields<4>, uh: u64, cx: &Cx, out: &mut Local) {
     let fl = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let (cid, user) = (fl(0), fl(1));
     if cid.is_empty() || user.is_empty() {
@@ -185,7 +185,7 @@ pub fn click_line(line: &'static [u8], f: &Fields<4>, cx: &Cx, out: &mut Local) 
     if ts < cx.ws - WEEK_MS || ts >= cx.we {
         return;
     }
-    let pkey = cx.links.person(hash(user));
+    let pkey = cx.links.person(uh);
     out.ck[bucket(pkey)].push(CRec { pkey, cid: pack(cid), ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
 }
 

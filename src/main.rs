@@ -133,13 +133,12 @@ fn main() {
     // phase A: links
     let next = AtomicUsize::new(0);
     par(nt, |_| loop {
-        let mut ix = Index::default();
         loop {
         let i = next.fetch_add(1, Relaxed);
         if i >= lk_chunks.len() {
             return;
         }
-        run_chunk::<2>(lk_chunks[i], &mut ix, |_| {}, |l, f| link_line(l, f, &cx));
+        run_chunk::<2, false>(lk_chunks[i], hash, |_| {}, |l, f, _| link_line(l, f, &cx));
         }
     });
     lap("links parsed");
@@ -175,25 +174,19 @@ fn main() {
     let locals: Vec<Local> = par(nt, |t| {
         pool.populate(t, nt);
         let mut l = Local::new(t, pool);
-        let mut ix = Index::default();
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= total {
                 return l;
             }
             if i < ev_chunks.len() {
-                run_chunk::<7>(
-                    ev_chunks[i],
-                    &mut ix,
-                    |u| cx.links.prefetch(hash(u)),
-                    |ln, f| event_line(ln, f, &cx, &mut l),
-                );
+                run_chunk::<7, true>(ev_chunks[i], hash, |h| cx.links.prefetch(h), |ln, f, uh| event_line(ln, f, uh, &cx, &mut l));
             } else {
-                run_chunk::<4>(
+                run_chunk::<4, true>(
                     ck_chunks[i - ev_chunks.len()],
-                    &mut ix,
-                    |u| cx.links.prefetch(hash(u)),
-                    |ln, f| click_line(ln, f, &cx, &mut l),
+                    hash,
+                    |h| cx.links.prefetch(h),
+                    |ln, f, uh| click_line(ln, f, uh, &cx, &mut l),
                 );
             }
         }

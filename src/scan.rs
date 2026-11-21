@@ -1,16 +1,9 @@
-//! Structural scan of a chunk of lines: SIMD index of commas, newlines and quotes,
-//! then a line iterator that applies the CSV dialect rules from the index alone.
+//! Line scanner: for each line of a chunk, one pass of AVX2 compares finds the newline, the commas and the
+//! quotes, applies the CSV dialect rules, and yields field bounds. No intermediate index.
 
-use crate::util::Chunk;
+use crate::util::{split, Chunk};
 
-#[derive(Default)]
-pub struct Index {
-    pub c: Vec<u32>,    // commas
-    pub n: Vec<u32>,    // newlines (plus a virtual one at the end of a file without final '\n')
-    pub qm: Vec<u64>,   // quote bitmask per 64-byte block
-    pub qpre: Vec<u32>, // quotes before each block
-    pub region: &'static [u8],
-}
+pub type Fields<const NF: usize> = [(u32, u32); NF];
 
 /// The bytes of whole data lines that start in the chunk (header line excluded).
 pub fn region(c: Chunk) -> &'static [u8] {
@@ -42,21 +35,6 @@ pub fn region(c: Chunk) -> &'static [u8] {
     }
 }
 
-/// Write the positions of the set bits of `m`; `k` writes are unconditional.
-#[inline(always)]
-unsafe fn emit<const K: usize>(out: *mut u32, base: u32, mut m: u64) -> usize {
-    let cnt = m.count_ones() as usize;
-    for i in 0..K {
-        *out.add(i) = base + m.trailing_zeros();
-        m &= m.wrapping_sub(1);
-    }
-    for i in K..cnt {
-        *out.add(i) = base + m.trailing_zeros();
-        m &= m.wrapping_sub(1);
-    }
-    cnt
-}
-
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
 unsafe fn block(p: *const u8) -> (u64, u64, u64) {
@@ -85,142 +63,109 @@ unsafe fn block(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
-impl Index {
-    pub fn build(&mut self, region: &'static [u8]) {
-        self.region = region;
-        let len = region.len();
-        self.c.clear();
-        self.n.clear();
-        self.qm.clear();
-        self.qpre.clear();
-        self.c.reserve(len / 8 + 128);
-        self.n.reserve(len / 32 + 128);
-        self.qm.reserve(len / 64 + 2);
-        self.qpre.reserve(len / 64 + 2);
-        let mut off = 0;
-        let mut tail = [0u8; 64];
-        let mut qrun = 0u32;
-        unsafe {
-            while off < len {
-                let p = if off + 64 <= len {
-                    region.as_ptr().add(off)
-                } else {
-                    tail[..len - off].copy_from_slice(&region[off..]);
-                    tail[len - off..].fill(0);
-                    tail.as_ptr()
-                };
-                let (c, n, q) = block(p);
-                let base = off as u32;
-                if self.c.capacity() - self.c.len() < 80 {
-                    self.c.reserve(len / 8 + 128);
-                }
-                if self.n.capacity() - self.n.len() < 80 {
-                    self.n.reserve(len / 32 + 128);
-                }
-                let k = emit::<8>(self.c.as_mut_ptr().add(self.c.len()), base, c);
-                self.c.set_len(self.c.len() + k);
-                let k = emit::<2>(self.n.as_mut_ptr().add(self.n.len()), base, n);
-                self.n.set_len(self.n.len() + k);
-                self.qm.push(q);
-                self.qpre.push(qrun);
-                qrun += q.count_ones();
-                off += 64;
-            }
-        }
-        self.qm.push(0);
-        self.qpre.push(qrun);
-        if region[len - 1] != b'\n' {
-            self.n.push(len as u32);
-        }
-    }
 
-    #[inline(always)]
-    fn qcount(&self, pos: u32) -> u32 {
-        let w = (pos >> 6) as usize;
-        unsafe { *self.qpre.get_unchecked(w) + (*self.qm.get_unchecked(w) & ((1u64 << (pos & 63)) - 1)).count_ones() }
-    }
-}
-
-/// Iterates the lines of an index. `NF` is the number of fields per line.
-#[derive(Clone, Copy)]
-pub struct Lines {
-    ci: usize,
-    ni: usize,
-    qprev: u32, // quotes before the current line start
-}
-
-pub type Fields<const NF: usize> = [(u32, u32); NF];
-
-impl Lines {
-    pub fn new() -> Lines {
-        Lines { ci: 0, ni: 0, qprev: 0 }
-    }
-
-    /// None at the end; Some(None) for a malformed line; Some(Some(fields)) with
-    /// quotes already stripped from the field bounds.
-    #[inline(always)]
-    pub fn next<const NF: usize>(&mut self, ix: &Index) -> Option<Option<Fields<NF>>> {
-        let nl = *ix.n.get(self.ni)?;
-        let ls = if self.ni == 0 { 0 } else { ix.n[self.ni - 1] + 1 };
-        self.ni += 1;
-        let c = &ix.c[..];
-        let cb = self.ci;
-        // exactly NF-1 commas before nl: the last one is before nl, the one after is past it
-        let ok = cb + NF - 1 <= c.len()
-            && (cb + NF - 1 == c.len() || unsafe { *c.get_unchecked(cb + NF - 1) } > nl)
-            && unsafe { *c.get_unchecked(cb + NF - 2) } < nl;
-        if !ok {
-            let mut e = cb;
-            while e < c.len() && c[e] < nl {
-                e += 1;
-            }
-            self.ci = e;
-            self.qprev = ix.qcount(nl);
-            return Some(None);
-        }
-        self.ci = cb + NF - 1;
-        let mut f: Fields<NF> = [(0, 0); NF];
-        unsafe {
-            for k in 0..NF {
-                f[k].0 = if k == 0 { ls } else { *c.get_unchecked(cb + k - 1) + 1 };
-                f[k].1 = if k < NF - 1 { *c.get_unchecked(cb + k) } else { nl };
-            }
-        }
-        let qn = ix.qcount(nl);
-        let nq = qn - self.qprev;
-        self.qprev = qn;
-        if nq != 0 {
-            let data = ix.region;
-            let mut quoted = 0;
-            for x in f.iter_mut() {
-                if x.1 > x.0 && data[x.0 as usize] == b'"' {
-                    quoted += 1;
-                    if x.1 - x.0 < 2 || data[x.1 as usize - 1] != b'"' {
-                        return Some(None);
-                    }
-                    x.0 += 1;
-                    x.1 -= 1;
-                }
-            }
-            if nq != 2 * quoted {
-                return Some(None);
-            }
-        }
-        Some(Some(f))
-    }
-}
-
-pub static NOPOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-const AHEAD: usize = 12;
-
-/// Run `f` on every well-formed line of the chunk. `pre` gets the user-id bytes of the
-/// line AHEAD lines ahead (assuming well-formed lines in between) to prefetch for.
+/// Scan the line starting at `p`. Returns (line length without '\n', fields or None if malformed).
+/// `buf` must have at least 128 readable bytes at `p`; bytes at or after `avail` must not be '\n', ',' or '"'
+/// (zero padding), and `avail` is the number of real bytes.
 #[inline(always)]
-pub fn run_chunk<const NF: usize>(
+unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Option<Fields<NF>>) {
+    let (c0, n0, q0) = block(p);
+    let (c1, n1, q1);
+    let l;
+    if n0 != 0 {
+        l = n0.trailing_zeros() as usize;
+        (c1, n1, q1) = (0, 0, 0);
+    } else {
+        let t = block(p.add(64));
+        (c1, n1, q1) = t;
+        if n1 != 0 {
+            l = 64 + n1.trailing_zeros() as usize;
+        } else {
+            // no newline within 128 bytes: last line without '\n', or a long line
+            return slow_line::<NF>(p, avail);
+        }
+    }
+    let (cm0, cm1, qm0, qm1) = if l < 64 {
+        let m = (1u64 << l) - 1;
+        (c0 & m, 0, q0 & m, 0)
+    } else {
+        let m = if l == 64 { 0 } else { (1u64 << (l - 64)) - 1 };
+        (c0, c1 & m, q0, q1 & m)
+    };
+    let _ = n1;
+    if (cm0.count_ones() + cm1.count_ones()) as usize != NF - 1 {
+        return (l, None);
+    }
+    let mut pos = [0u32; 16];
+    let mut k = 0;
+    let mut m = cm0;
+    while m != 0 {
+        pos[k] = m.trailing_zeros();
+        m &= m - 1;
+        k += 1;
+    }
+    m = cm1;
+    while m != 0 {
+        pos[k] = 64 + m.trailing_zeros();
+        m &= m - 1;
+        k += 1;
+    }
+    let mut f: Fields<NF> = [(0, 0); NF];
+    for i in 0..NF {
+        f[i].0 = if i == 0 { 0 } else { pos[i - 1] + 1 };
+        f[i].1 = if i < NF - 1 { pos[i] } else { l as u32 };
+    }
+    let nq = qm0.count_ones() + qm1.count_ones();
+    if nq != 0 && !strip_quotes::<NF>(p, &mut f, nq) {
+        return (l, None);
+    }
+    (l, Some(f))
+}
+
+#[inline(always)]
+unsafe fn strip_quotes<const NF: usize>(p: *const u8, f: &mut Fields<NF>, nq: u32) -> bool {
+    let mut quoted = 0;
+    for x in f.iter_mut() {
+        if x.1 > x.0 && *p.add(x.0 as usize) == b'"' {
+            quoted += 1;
+            if x.1 - x.0 < 2 || *p.add(x.1 as usize - 1) != b'"' {
+                return false;
+            }
+            x.0 += 1;
+            x.1 -= 1;
+        }
+    }
+    nq == 2 * quoted
+}
+
+/// Lines with no newline in 128 bytes: find it the slow way (or take the rest of the data).
+#[cold]
+#[inline(never)]
+unsafe fn slow_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Option<Fields<NF>>) {
+    let rest = std::slice::from_raw_parts(p, avail);
+    let l = memchr::memchr(b'\n', rest).unwrap_or(avail);
+    let mut f = [(0usize, 0usize); NF];
+    if split::<NF>(&rest[..l], &mut f) {
+        let mut g: Fields<NF> = [(0, 0); NF];
+        for i in 0..NF {
+            g[i] = (f[i].0 as u32, f[i].1 as u32);
+        }
+        (l, Some(g))
+    } else {
+        (l, None)
+    }
+}
+
+const BATCH: usize = 16;
+
+/// Run `f(line, fields, uh)` on every well-formed line of the chunk. `line` starts at the line's first byte.
+/// If `PRE`, `uh` is the hash of field 1 (the user id) and its link-table slot is prefetched a batch ahead.
+#[inline(always)]
+pub fn run_chunk<const NF: usize, const PRE: bool>(
     c: Chunk,
-    ix: &mut Index,
-    mut pre: impl FnMut(&'static [u8]),
-    mut f: impl FnMut(&'static [u8], &Fields<NF>),
+    hash_pre: impl Fn(&'static [u8]) -> u64,
+    prefetch: impl Fn(u64),
+    mut f: impl FnMut(&'static [u8], &Fields<NF>, u64),
 ) {
     let r = region(c);
     if r.is_empty() {
@@ -229,27 +174,54 @@ pub fn run_chunk<const NF: usize>(
     if !NOPOP.load(std::sync::atomic::Ordering::Relaxed) {
         populate(r);
     }
-    ix.build(r);
-    let mut it = Lines::new();
-    while let Some(line) = it.next::<NF>(ix) {
-        if NF > 2 {
-            let k = it.ci + (AHEAD - 1) * (NF - 1);
-            if k + 1 < ix.c.len() {
-                let (mut s, mut e) = unsafe { (*ix.c.get_unchecked(k) as usize + 1, *ix.c.get_unchecked(k + 1) as usize) };
-                if e > s + 1 && r[s] == b'"' {
-                    s += 1;
-                    e -= 1;
-                }
-                if e > s {
-                    pre(&r[s..e]);
-                }
+    let len = r.len();
+    let mut p = 0usize;
+    // lines whose 128-byte window would run past the region go through a zero-padded copy
+    let tail_start = len.saturating_sub(128);
+    let mut batch: [(u32, Fields<NF>, u64); BATCH] = [(0, [(0, 0); NF], 0); BATCH];
+    let mut bn;
+    while p < tail_start {
+        bn = 0;
+        let mut q = p;
+        while bn < BATCH && q < tail_start {
+            let (l, fl) = unsafe { scan_line::<NF>(r.as_ptr().add(q), len - q) };
+            if let Some(fl) = fl {
+                let uh = if PRE {
+                    let u = &r[q + fl[1].0 as usize..q + fl[1].1 as usize];
+                    let h = hash_pre(u);
+                    prefetch(h);
+                    h
+                } else {
+                    0
+                };
+                batch[bn] = (q as u32, fl, uh);
+                bn += 1;
             }
+            q += l + 1;
         }
-        if let Some(fl) = &line {
-            f(r, fl);
+        for b in &batch[..bn] {
+            f(&r[b.0 as usize..], &b.1, b.2);
+        }
+        p = q;
+    }
+    if p < len {
+        // tail: copy into a padded buffer for scanning; fields are relative to the line start, so the real region is used for data
+        let mut buf = [0u8; 384];
+        let rem = len - p;
+        buf[..rem].copy_from_slice(&r[p..]);
+        let mut q = 0usize;
+        while q < rem {
+            let (l, fl) = unsafe { scan_line::<NF>(buf.as_ptr().add(q), rem - q) };
+            if let Some(fl) = fl {
+                let uh = if PRE { hash_pre(&r[p + q + fl[1].0 as usize..p + q + fl[1].1 as usize]) } else { 0 };
+                f(&r[p + q..], &fl, uh);
+            }
+            q += l + 1;
         }
     }
 }
+
+pub static NOPOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Map the chunk's pages in one call instead of faulting them in 64 KB at a time.
 fn populate(r: &[u8]) {
