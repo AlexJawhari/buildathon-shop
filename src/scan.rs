@@ -146,13 +146,14 @@ impl Index {
 pub struct Lines {
     ci: usize,
     ni: usize,
+    qprev: u32, // quotes before the current line start
 }
 
 pub type Fields<const NF: usize> = [(u32, u32); NF];
 
 impl Lines {
     pub fn new() -> Lines {
-        Lines { ci: 0, ni: 0 }
+        Lines { ci: 0, ni: 0, qprev: 0 }
     }
 
     /// None at the end; Some(None) for a malformed line; Some(Some(fields)) with
@@ -174,6 +175,7 @@ impl Lines {
                 e += 1;
             }
             self.ci = e;
+            self.qprev = ix.qcount(nl);
             return Some(None);
         }
         self.ci = cb + NF - 1;
@@ -184,7 +186,9 @@ impl Lines {
                 f[k].1 = if k < NF - 1 { *c.get_unchecked(cb + k) } else { nl };
             }
         }
-        let nq = ix.qcount(nl) - ix.qcount(ls);
+        let qn = ix.qcount(nl);
+        let nq = qn - self.qprev;
+        self.qprev = qn;
         if nq != 0 {
             let data = ix.region;
             let mut quoted = 0;
@@ -235,7 +239,7 @@ pub fn run_chunk<const NF: usize>(
         if NF > 2 {
             let k = it.ci + (AHEAD - 1) * (NF - 1);
             if k + 1 < ix.c.len() {
-                let (mut s, mut e) = (ix.c[k] as usize + 1, ix.c[k + 1] as usize);
+                let (mut s, mut e) = unsafe { (*ix.c.get_unchecked(k) as usize + 1, *ix.c.get_unchecked(k + 1) as usize) };
                 if e > s + 1 && r[s] == b'"' {
                     s += 1;
                     e -= 1;
