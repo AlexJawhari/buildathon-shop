@@ -1,6 +1,7 @@
 //! Shopping Sessions pipeline: mmap CSVs, parse in parallel, dedup, sessionize, write Parquet.
 
 mod bucket;
+mod encode;
 mod ingest;
 mod links;
 mod scan;
@@ -10,6 +11,7 @@ mod sessions;
 mod util;
 
 use bucket::Bucket;
+use encode::*;
 use ingest::*;
 use scan::*;
 use parquet::*;
@@ -339,34 +341,67 @@ fn main() {
     std::process::exit(0);
 }
 
+/// Dictionary-encode `vals` (written as `width` little-endian bytes per dictionary entry).
+fn int_col(vals: impl Iterator<Item = u64>, width: usize) -> (Vec<u8>, usize, Vec<u8>) {
+    let mut d = Dict::new();
+    let idx: Vec<u32> = vals.map(|v| d.id(v)).collect();
+    let bw = bit_width(d.values.len());
+    let mut data = vec![bw as u8];
+    hybrid(&idx, bw, &mut data);
+    let dict = d.values.iter().flat_map(|v| v.to_le_bytes()[..width].to_vec()).collect();
+    (dict, d.values.len(), data)
+}
+
 fn write_user(path: &Path, c: &UserCols, cats: &[&[u8]], force: bool) {
     if c.n == 0 && !force {
         return;
     }
     let n = c.n;
-    let mut cdata = def_levels(&c.has_cat);
-    for &k in &c.cat {
-        let name = cats[k as usize];
-        cdata.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        cdata.extend_from_slice(name);
+    // user_id: one dictionary entry per person, indices are runs
+    let mut uidx = Vec::with_capacity(n);
+    for (p, &k) in c.person_rows.iter().enumerate() {
+        uidx.extend(std::iter::repeat(p as u32).take(k as usize));
     }
-    let col = |name, ptype, conv, data| mkcol(n, name, ptype, conv, data);
+    let ubw = bit_width(c.person_rows.len());
+    let mut udata = vec![ubw as u8];
+    hybrid(&uidx, ubw, &mut udata);
+    drop(uidx);
+    let (dd, dn, dday) = int_col(c.day.iter().map(|&v| v as u64), 4);
+    let (sd, sn, dses) = int_col(c.sessions.iter().map(|&v| v as u64), 4);
+    let (ed, en, deve) = int_col(c.events.iter().map(|&v| v as u64), 4);
+    let (rd, rn, drev) = int_col(c.rev.iter().copied(), 8);
+    // top_category: dictionary of all category names, indices for the non-null rows
+    let mut cdict = vec![];
+    for name in cats {
+        cdict.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        cdict.extend_from_slice(name);
+    }
+    let cbw = bit_width(cats.len());
+    let mut cdata = def_levels(&c.has_cat);
+    cdata.push(cbw as u8);
+    let cidx: Vec<u32> = c.cat.iter().map(|&k| k as u32).collect();
+    hybrid(&cidx, cbw, &mut cdata);
+    let col = |name, ptype, conv, dict, entries, data| dictcol(n, name, ptype, conv, dict, entries, data);
     write(
         path,
         n,
         &[
-            col("user_id", T_BYTES, Some(CONV_UTF8), &c.user),
-            col("day", T_I32, Some(CONV_DATE), &c.day),
-            col("sessions", T_I32, None, &c.sessions),
-            col("events", T_I32, None, &c.events),
-            col("revenue_cents", T_I64, None, &c.rev),
-            Col { name: "top_category", ptype: T_BYTES, conv: Some(CONV_UTF8), optional: true, data: &cdata, nvalues: n },
+            col("user_id", T_BYTES, Some(CONV_UTF8), &c.names, c.person_rows.len(), &udata),
+            col("day", T_I32, Some(CONV_DATE), &dd, dn, &dday),
+            col("sessions", T_I32, None, &sd, sn, &dses),
+            col("events", T_I32, None, &ed, en, &deve),
+            col("revenue_cents", T_I64, None, &rd, rn, &drev),
+            Col { name: "top_category", ptype: T_BYTES, conv: Some(CONV_UTF8), optional: true, data: &cdata, dict: Some((&cdict, cats.len())), nvalues: n },
         ],
     );
 }
 
+fn dictcol<'a>(n: usize, name: &'static str, ptype: i32, conv: Option<i32>, dict: &'a [u8], entries: usize, data: &'a [u8]) -> Col<'a> {
+    Col { name, ptype, conv, optional: false, data, dict: Some((dict, entries)), nvalues: n }
+}
+
 fn mkcol<'a>(n: usize, name: &'static str, ptype: i32, conv: Option<i32>, data: &'a [u8]) -> Col<'a> {
-    Col { name, ptype, conv, optional: false, data, nvalues: n }
+    Col { name, ptype, conv, optional: false, data, dict: None, nvalues: n }
 }
 
 /// Unmap the pages of a finished chunk (page cache keeps the data) so the kernel's teardown work is spread over

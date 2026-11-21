@@ -13,7 +13,8 @@ pub struct Col<'a> {
     pub ptype: i32,
     pub conv: Option<i32>,
     pub optional: bool,
-    pub data: &'a [u8], // page body: levels (if optional) then PLAIN values
+    pub data: &'a [u8], // data page body: levels (if optional) then PLAIN values, or bit width + hybrid indices if `dict`
+    pub dict: Option<(&'a [u8], usize)>, // dictionary page body (PLAIN) and its entry count
     pub nvalues: usize, // rows including nulls
 }
 
@@ -112,17 +113,34 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
     let mut file = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path).unwrap());
     file.write_all(b"PAR1").unwrap();
     let mut pos: i64 = 4;
-    let mut chunk_meta: Vec<(i64, i64, i64)> = vec![]; // offset, total size, num values
+    let mut chunk_meta: Vec<(i64, i64, i64, i64, i64)> = vec![]; // first page offset, total size, num values, dict page offset (0 = none), data page offset
     if nrows > 0 {
         for c in cols {
             let off = pos;
+            let mut dict_off = None;
+            if let Some((d, entries)) = c.dict {
+                let mut h = Th::new();
+                h.i32(1, 2); // DICTIONARY_PAGE
+                h.i32(2, d.len() as i32);
+                h.i32(3, d.len() as i32);
+                h.begin_field(7);
+                h.i32(1, entries as i32);
+                h.i32(2, 0); // PLAIN
+                h.end();
+                h.end();
+                file.write_all(&h.b).unwrap();
+                file.write_all(d).unwrap();
+                dict_off = Some(pos);
+                pos += (h.b.len() + d.len()) as i64;
+            }
+            let data_off = pos;
             let mut h = Th::new();
             h.i32(1, 0);
             h.i32(2, c.data.len() as i32);
             h.i32(3, c.data.len() as i32);
             h.begin_field(5);
             h.i32(1, c.nvalues as i32);
-            h.i32(2, 0);
+            h.i32(2, if c.dict.is_some() { 8 } else { 0 }); // RLE_DICTIONARY or PLAIN
             h.i32(3, 3);
             h.i32(4, 3);
             h.end();
@@ -130,7 +148,7 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
             file.write_all(&h.b).unwrap();
             file.write_all(c.data).unwrap();
             pos += (h.b.len() + c.data.len()) as i64;
-            chunk_meta.push((off, pos - off, c.nvalues as i64));
+            chunk_meta.push((off, pos - off, c.nvalues as i64, dict_off.unwrap_or(0), data_off));
         }
     }
     let mut m = Th::new();
@@ -156,16 +174,22 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
         m.begin();
         m.list(1, 12, cols.len());
         let mut total = 0;
-        for (c, &(off, size, nv)) in cols.iter().zip(&chunk_meta) {
+        for (c, &(off, size, nv, dict_off, data_off)) in cols.iter().zip(&chunk_meta) {
             total += size;
             m.begin();
             m.i64(2, off);
             m.begin_field(3);
             m.i32(1, c.ptype);
-            m.list(2, 5, if c.optional { 2 } else { 1 });
-            m.varint(Th::zig(0));
-            if c.optional {
-                m.varint(Th::zig(3));
+            let mut encs = vec![0i64];
+            if c.optional || c.dict.is_some() {
+                encs.push(3);
+            }
+            if c.dict.is_some() {
+                encs.push(8);
+            }
+            m.list(2, 5, encs.len());
+            for e in encs {
+                m.varint(Th::zig(e));
             }
             m.list(3, 8, 1);
             m.bin_val(c.name);
@@ -173,7 +197,10 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
             m.i64(5, nv);
             m.i64(6, size);
             m.i64(7, size);
-            m.i64(9, off);
+            m.i64(9, data_off);
+            if c.dict.is_some() {
+                m.i64(11, dict_off);
+            }
             m.end();
             m.end();
         }

@@ -538,7 +538,7 @@ impl Input {
 }
 
 /// Default input method. pread avoids page-table walks on VMs but costs a copy; measured slower on bare metal.
-const DEFAULT_READ_IO: bool = false;
+const DEFAULT_READ_IO: bool = true;
 
 /// True when events and clicks should be read with pread into per-thread buffers instead of mmap.
 /// `SHOP_IO=read|mmap` overrides DEFAULT_READ_IO.

@@ -7,15 +7,17 @@ use crate::util::*;
 const GAP_MS: i64 = 30 * 60 * 1000;
 pub const NO_CAT: u16 = u16::MAX;
 
-/// user_daily rows, stored column-wise in PLAIN Parquet encoding as they are produced.
+/// user_daily rows, stored column-wise as they are produced. Rows of one person are contiguous, so the user_id
+/// column is a dictionary of names (PLAIN, length-prefixed) plus the number of rows per person.
 #[derive(Default)]
 pub struct UserCols {
     pub n: usize,
-    pub user: Vec<u8>,
-    pub day: Vec<u8>,
-    pub sessions: Vec<u8>,
-    pub events: Vec<u8>,
-    pub rev: Vec<u8>,
+    pub names: Vec<u8>,
+    pub person_rows: Vec<u32>,
+    pub day: Vec<u32>,
+    pub sessions: Vec<u32>,
+    pub events: Vec<u32>,
+    pub rev: Vec<u64>,
     pub has_cat: Vec<bool>,
     pub cat: Vec<u16>,
 }
@@ -58,11 +60,12 @@ impl State {
             camp: vec![[0; 4]; (ncamp + 1) * nday],
             cols: UserCols {
                 n: 0,
-                user: Vec::with_capacity(est_rows * 14),
-                day: Vec::with_capacity(est_rows * 4),
-                sessions: Vec::with_capacity(est_rows * 4),
-                events: Vec::with_capacity(est_rows * 4),
-                rev: Vec::with_capacity(est_rows * 8),
+                names: Vec::with_capacity(est_rows * 4),
+                person_rows: Vec::with_capacity(est_rows / 3),
+                day: Vec::with_capacity(est_rows),
+                sessions: Vec::with_capacity(est_rows),
+                events: Vec::with_capacity(est_rows),
+                rev: Vec::with_capacity(est_rows),
                 has_cat: Vec::with_capacity(est_rows),
                 cat: Vec::with_capacity(est_rows),
             },
@@ -153,7 +156,7 @@ impl State {
         self.csorted = csorted;
     }
 
-    fn flush_day(&mut self, name: u64, day: i32, sessions: u32, events: u32, rev: u64) {
+    fn flush_day(&mut self, day: i32, sessions: u32, events: u32, rev: u64) {
         let mut cat = NO_CAT;
         if !self.cat_touched.is_empty() {
             let mut best = 0;
@@ -170,13 +173,10 @@ impl State {
             self.cat_touched.clear();
         }
         let c = &mut self.cols;
-        let nm = unpack(name);
-        c.user.extend_from_slice(&(nm.len() as u32).to_le_bytes());
-        c.user.extend_from_slice(nm);
-        c.day.extend_from_slice(&day.to_le_bytes());
-        c.sessions.extend_from_slice(&sessions.to_le_bytes());
-        c.events.extend_from_slice(&events.to_le_bytes());
-        c.rev.extend_from_slice(&(rev as i64).to_le_bytes());
+        c.day.push(day as u32);
+        c.sessions.push(sessions);
+        c.events.push(events);
+        c.rev.push(rev);
         c.has_cat.push(cat != NO_CAT);
         if cat != NO_CAT {
             c.cat.push(cat);
@@ -189,6 +189,7 @@ impl State {
         let ws = self.ws;
         let cbase = ws - WEEK_MS;
         self.sess.clear();
+        let first_row = self.cols.n;
         let (mut uday, mut us, mut ue, mut ur) = (-1i32, 0u32, 0u32, 0u64);
         let mut prev = u32::MAX;
         for e in evs {
@@ -197,7 +198,7 @@ impl State {
                 let day = (start.div_euclid(DAY_MS) - self.dbase) as i32;
                 if day != uday {
                     if uday >= 0 {
-                        self.flush_day(name, (uday as i64 + self.dbase) as i32, us, ue, ur);
+                        self.flush_day((uday as i64 + self.dbase) as i32, us, ue, ur);
                     }
                     uday = day;
                     us = 0;
@@ -222,7 +223,12 @@ impl State {
                 self.cat_sum[k] += price;
             }
         }
-        self.flush_day(name, (uday as i64 + self.dbase) as i32, us, ue, ur);
+        self.flush_day((uday as i64 + self.dbase) as i32, us, ue, ur);
+        let nm = unpack(name);
+        let c = &mut self.cols;
+        c.person_rows.push((c.n - first_row) as u32);
+        c.names.extend_from_slice(&(nm.len() as u32).to_le_bytes());
+        c.names.extend_from_slice(nm);
 
         // credit
         let mut ci = 0;
