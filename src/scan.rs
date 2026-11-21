@@ -211,7 +211,6 @@ impl Lines {
 }
 
 pub static NOPOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub static MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const AHEAD: usize = 12;
 
 /// Run `f` on every well-formed line of the chunk. `pre` gets the user-id bytes of the
@@ -231,9 +230,6 @@ pub fn run_chunk<const NF: usize>(
         populate(r);
     }
     ix.build(r);
-    if MODE.load(std::sync::atomic::Ordering::Relaxed) == 5 {
-        return;
-    }
     let mut it = Lines::new();
     while let Some(line) = it.next::<NF>(ix) {
         if NF > 2 {

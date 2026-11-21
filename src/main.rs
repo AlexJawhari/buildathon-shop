@@ -163,8 +163,6 @@ fn main() {
         (total as f64 / (sample.len() as f64 / lines as f64) * 1.15) as usize / nt
     };
     let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
-    let mode: u32 = std::env::var("SHOP_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    scan::MODE.store(mode, Relaxed);
     scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
     let next = AtomicUsize::new(0);
     let total = ev_chunks.len() + ck_chunks.len();
@@ -181,14 +179,14 @@ fn main() {
                     ev_chunks[i],
                     &mut ix,
                     |u| cx.links.prefetch(hash(u)),
-                    |ln, f| if mode == 0 || mode >= 11 { event_line(ln, f, &cx, &mut l) } else if mode == 2 { std::hint::black_box(ln[f[2].0 as usize]); },
+                    |ln, f| event_line(ln, f, &cx, &mut l),
                 );
             } else {
                 run_chunk::<4>(
                     ck_chunks[i - ev_chunks.len()],
                     &mut ix,
                     |u| cx.links.prefetch(hash(u)),
-                    |ln, f| if mode < 3 || mode >= 11 { click_line(ln, f, &cx, &mut l) },
+                    |ln, f| click_line(ln, f, &cx, &mut l),
                 );
             }
         }
