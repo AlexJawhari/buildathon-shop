@@ -89,3 +89,12 @@ Each 4 KB fault costs about 4-5 us here, so touched memory is the sys-time cost.
 | Profile (sampler, no THP): 34% unresolved, scan_line + strip_quotes 9%, PRec push 6%, links 4%, sessions 4%, parse_ts 2.5% | flat, no single hotspot | |
 
 Untried, sized from the fault cost: Slim 20 B -> 16 B (about -80 MB, est. -2% CPU); CRec 24 B -> 16-17 B (about -35 MB, est. -1%).
+
+## Round 3, part 2
+
+| Idea | Result | Verdict |
+| --- | --- | --- |
+| Scorer A/B of b7f3aaa (no MADV_HUGEPAGE) | 1.22 s vs 1.03 s for 693acdd | reverted (5fe6764). Local THP behaviour is a bad proxy for the scorer |
+| SHOP_IO=mmap default, sibling of the revert (exp-io, 2ec03b3) | gates pass in fresh output dirs | for a scorer A/B only |
+| Slim 16 B (drop the top 10 bits of h for the bucket, drop the 25-bit check) | saves about 80 MB; identity falls to 54 bits, about 1e-5 false-dedup risk per run at 20M; under THP the saving is tens of zeroed huge pages | not built |
+| Output dir reused between runs | intermittent DIFFER (duplicate user_daily keys, about 1 in 8 reused-dir runs) on 693acdd and on this branch, in both read and mmap modes; 0 of 40+ fresh-dir runs differ | open. Gates must use fresh output dirs until the cause is found |
