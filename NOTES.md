@@ -74,3 +74,18 @@ Not tried: PGO, AVX-512 scan, dictionary-encoded Parquet columns (output is 75 M
 | target-cpu cascadelake vs x86-64-v3 | equal | keep v3 |
 | PGO (instrument, train on 3M generated events, rebuild; falls back to plain build) | 5-8% CPU | keep |
 | Docker empty-run baseline (fixture A1, scorer flags) | about 0.26-0.30 s fixed cost | |
+
+## Round 3 (speed experiments, branch exp; CPU = user+sys on big20, alternating runs, load 5-10)
+
+Profile on 693acdd-era binary: sys 2.5 s of 6.1 s CPU; 300k minor faults, almost all in the parse phase (pool pages).
+Each 4 KB fault costs about 4-5 us here, so touched memory is the sys-time cost.
+
+| Idea | Result | Verdict |
+| --- | --- | --- |
+| Drop MADV_HUGEPAGE on the pool | THP was only partly granted (368 MB of 1.38 GB RSS huge, the rest after compaction stalls); sys 2.5 -> 1.4 s; 7.11 -> 5.52 s CPU (5 runs), wall 0.94 -> 0.67 s | keep (b7f3aaa). Risk: on a host with free contiguous memory THP may win; decide by a scorer A/B |
+| MADV_POPULATE_WRITE off (SHOP_NOPOP=1) with no THP | 5.27 vs 5.24 s CPU | drop (no change) |
+| SHOP_IO=mmap vs pread (no THP) | mmap about 0.5 s less CPU locally (sys 0.6 vs 1.4 s, user +0.3 s) | not changed: pread is the default chosen for the scorer VM (round 2); needs a scorer A/B to flip |
+| pread without zero-fill of the chunk buffer (set_len instead of resize) | 5.36 vs 5.34 s CPU | drop (memset is cheap) |
+| Profile (sampler, no THP): 34% unresolved, scan_line + strip_quotes 9%, PRec push 6%, links 4%, sessions 4%, parse_ts 2.5% | flat, no single hotspot | |
+
+Untried, sized from the fault cost: Slim 20 B -> 16 B (about -80 MB, est. -2% CPU); CRec 24 B -> 16-17 B (about -35 MB, est. -1%).
