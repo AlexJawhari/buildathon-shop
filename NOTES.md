@@ -59,3 +59,18 @@ are noisy, so user+sys CPU is the main number. 20M events / 5M clicks, 143 event
 Page-fault counts vary 70k-400k run to run on this box (swap in use, THP availability), so fault numbers are not comparable across runs.
 
 Not tried: PGO, AVX-512 scan, dictionary-encoded Parquet columns (output is 75 MB at 20M events, about 225 MB at 60M).
+
+## Round 2 (target: faster on the scorer; real score of 1373b40 was 1.37 s)
+
+| Experiment | Result | Verdict |
+| --- | --- | --- |
+| Fused per-line AVX2 scanner (128-byte window per line, quote rules from bit masks) replacing the block index | parse CPU 3.1 -> 2.8 s | keep |
+| Dense person ids: one shared ID table (links + events + clicks) gives a u32 pid; records 24 -> 12 bytes; no per-bucket hash table in stage 3 | total CPU 4.4-5 -> 4.1 s | keep |
+| Prefetch 192 B ahead of each bucket write cursor | within noise | keep |
+| P (log2 partitions) 8 vs 10 | equal | keep 10 |
+| pread input instead of mmap (SHOP_IO=read) | +0.5 s CPU on this bare-metal box; other teams report mmap slower on the scorer VM | A/B on the scorer: commit with DEFAULT_READ_IO=true |
+| MADV_POPULATE_READ / MAP_POPULATE for input | no gain (microbench: populate +30% CPU) | off |
+| SWAR epoch-ms parse (two overlapping 8-digit loads) | about 2% | keep, fuzzed against scalar |
+| target-cpu cascadelake vs x86-64-v3 | equal | keep v3 |
+| PGO (instrument, train on 3M generated events, rebuild; falls back to plain build) | 5-8% CPU | keep |
+| Docker empty-run baseline (fixture A1, scorer flags) | about 0.26-0.30 s fixed cost | |
