@@ -119,7 +119,10 @@ impl Links {
 
     /// Step 1 (parallel over the slots inserted by link lines): give every union-find root a person id.
     pub fn assign_roots(&self, slots: &[u32], tmp: &[AtomicU32]) {
-        for &i in slots {
+        for (j, &i) in slots.iter().enumerate() {
+            if let Some(&n) = slots.get(j + 12) {
+                self.prefetch_slot(n as usize);
+            }
             let i = i as usize;
             if self.parent[i].load(Relaxed) == 0 {
                 let pid = self.npid.fetch_add(1, Relaxed);
@@ -130,7 +133,15 @@ impl Links {
     }
     /// Step 2 (after step 1 finished everywhere): every slot takes its root's person id.
     pub fn assign_all(&self, slots: &[u32], tmp: &[AtomicU32]) {
-        for &i in slots {
+        for (j, &i) in slots.iter().enumerate() {
+            if let Some(&n) = slots.get(j + 12) {
+                self.prefetch_slot(n as usize);
+            }
+            if let Some(&n) = slots.get(j + 6) {
+                // the parent entry was prefetched 6 iterations ago: pull in the tmp entry of the likely root
+                let p = self.parent[n as usize].load(Relaxed);
+                Self::pf(&tmp[if p == 0 { n as usize } else { p as usize - 1 }]);
+            }
             let i = i as usize;
             let r = self.find(i);
             self.slots[i].v.store(tmp[r].load(Relaxed) as u64, Relaxed);
@@ -138,6 +149,20 @@ impl Links {
     }
     pub fn tmp(&self) -> Box<[AtomicU32]> {
         zeroed(self.slots.len())
+    }
+
+    #[inline(always)]
+    fn pf<T>(r: &T) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(r as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_slot(&self, i: usize) {
+        Self::pf(&self.parent[i]);
+        Self::pf(&self.slots[i]);
     }
 
     #[inline(always)]

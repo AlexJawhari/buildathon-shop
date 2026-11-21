@@ -149,7 +149,7 @@ fn main() {
             if i >= lk_chunks.len() {
                 return fresh;
             }
-            run_chunk::<2, false>(lk_chunks[i], hash, |_| {}, |l, f, _| link_line(l, f, &cx, &mut fresh));
+            run_chunk::<2, true>(lk_chunks[i], hash, |h| cx.links.prefetch(h), |l, f, _| link_line(l, f, &cx, &mut fresh));
         }
     });
     lap("links parsed");
@@ -190,6 +190,7 @@ fn main() {
                     run_region::<7, true>(read_region(&ev_files[fi], a, b, &mut buf), hash, pre, f);
                 } else {
                     run_chunk::<7, true>((ev_files[fi].map, a, b), hash, pre, f);
+                    drop_pages(ev_files[fi].map, a, b);
                 }
             } else {
                 let (fi, a, b) = ck_chunks[i - ev_chunks.len()];
@@ -199,6 +200,7 @@ fn main() {
                     run_region::<4, true>(read_region(&ck_files[fi], a, b, &mut buf), hash, pre, f);
                 } else {
                     run_chunk::<4, true>((ck_files[fi].map, a, b), hash, pre, f);
+                    drop_pages(ck_files[fi].map, a, b);
                 }
             }
         }
@@ -330,11 +332,6 @@ fn main() {
             col("assisted_sessions", T_I64, None, &n3),
         ],
     );
-    // spread the kernel's page teardown over all threads before exiting
-    par(nt, |t| {
-        pool.release(t, nt);
-        unmap_inputs(t, nt);
-    });
     lap("done");
     if profiling {
         prof::dump();
@@ -370,4 +367,13 @@ fn write_user(path: &Path, c: &UserCols, cats: &[&[u8]], force: bool) {
 
 fn mkcol<'a>(n: usize, name: &'static str, ptype: i32, conv: Option<i32>, data: &'a [u8]) -> Col<'a> {
     Col { name, ptype, conv, optional: false, data, nvalues: n }
+}
+
+/// Unmap the pages of a finished chunk (page cache keeps the data) so the kernel's teardown work is spread over
+/// the worker threads now instead of running serially at process exit.
+fn drop_pages(map: &'static [u8], a: usize, b: usize) {
+    let (lo, hi) = ((a + 4095) & !4095, b & !4095);
+    if hi > lo {
+        unsafe { libc::madvise(map.as_ptr().add(lo) as *mut _, hi - lo, libc::MADV_DONTNEED) };
+    }
 }

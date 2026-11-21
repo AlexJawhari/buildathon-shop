@@ -57,14 +57,6 @@ impl Pool {
             unsafe { libc::madvise(p as *mut _, n, 23) }; // MADV_POPULATE_WRITE; older kernels ignore it
         }
     }
-
-    /// Give part `i` back to the kernel (call from `parts` threads so teardown runs in parallel).
-    pub fn release(&self, i: usize, parts: usize) {
-        let (p, n) = self.part(i, parts);
-        if n > 0 {
-            unsafe { libc::madvise(p as *mut _, n, libc::MADV_DONTNEED) };
-        }
-    }
 }
 
 /// Per-thread bump allocator over slabs of a Pool; falls back to the heap when the pool is used up.

@@ -203,6 +203,10 @@ pub fn run_region<const NF: usize, const PRE: bool>(
                     let u = &r[q + fl[1].0 as usize..q + fl[1].1 as usize];
                     let h = hash_pre(u);
                     prefetch(h);
+                    if NF == 2 {
+                        // link lines name two IDs: prefetch the first one's slot too
+                        prefetch(hash_pre(&r[q + fl[0].0 as usize..q + fl[0].1 as usize]));
+                    }
                     h
                 } else {
                     0
