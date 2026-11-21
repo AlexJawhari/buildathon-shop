@@ -8,12 +8,12 @@ pub const T_BYTES: i32 = 6;
 pub const CONV_UTF8: i32 = 0;
 pub const CONV_DATE: i32 = 6;
 
-pub struct Col {
+pub struct Col<'a> {
     pub name: &'static str,
     pub ptype: i32,
     pub conv: Option<i32>,
     pub optional: bool,
-    pub data: Vec<u8>, // page body: levels (if optional) then PLAIN values
+    pub data: &'a [u8], // page body: levels (if optional) then PLAIN values
     pub nvalues: usize, // rows including nulls
 }
 
@@ -109,12 +109,13 @@ pub fn def_levels(valid: &[bool]) -> Vec<u8> {
 }
 
 pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
-    let mut f: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + 64).sum::<usize>() + 4096);
-    f.extend_from_slice(b"PAR1");
+    let mut file = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path).unwrap());
+    file.write_all(b"PAR1").unwrap();
+    let mut pos: i64 = 4;
     let mut chunk_meta: Vec<(i64, i64, i64)> = vec![]; // offset, total size, num values
     if nrows > 0 {
         for c in cols {
-            let off = f.len() as i64;
+            let off = pos;
             let mut h = Th::new();
             h.i32(1, 0);
             h.i32(2, c.data.len() as i32);
@@ -126,9 +127,10 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
             h.i32(4, 3);
             h.end();
             h.end();
-            f.extend_from_slice(&h.b);
-            f.extend_from_slice(&c.data);
-            chunk_meta.push((off, f.len() as i64 - off, c.nvalues as i64));
+            file.write_all(&h.b).unwrap();
+            file.write_all(c.data).unwrap();
+            pos += (h.b.len() + c.data.len()) as i64;
+            chunk_meta.push((off, pos - off, c.nvalues as i64));
         }
     }
     let mut m = Th::new();
@@ -183,9 +185,8 @@ pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) {
     }
     m.bin(6, "shop");
     m.end();
-    f.extend_from_slice(&m.b);
-    f.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
-    f.extend_from_slice(b"PAR1");
-    let mut file = std::fs::File::create(path).unwrap();
-    file.write_all(&f).unwrap();
+    file.write_all(&m.b).unwrap();
+    file.write_all(&(m.b.len() as u32).to_le_bytes()).unwrap();
+    file.write_all(b"PAR1").unwrap();
+    file.flush().unwrap();
 }

@@ -1,6 +1,7 @@
 //! Parsing of event and click lines into partitioned records.
 
 use crate::links::Links;
+use crate::bucket::*;
 use crate::scan::Fields;
 use crate::util::*;
 
@@ -107,21 +108,25 @@ pub struct Cx {
 
 pub struct Local {
     pub t: usize,
-    pub pv: Vec<Vec<PRec>>,
-    pub sl: Vec<Vec<Slim>>,
-    pub ck: Vec<Vec<CRec>>,
+    pub pv: Vec<Bucket<PRec>>,
+    pub sl: Vec<Bucket<Slim>>,
+    pub ck: Vec<Bucket<CRec>>,
     pub dc: DateCache,
+    pub arena: Arena,
 }
 impl Local {
+    /// `est_ev` / `est_ck`: expected events / clicks this thread will parse.
     pub fn new(t: usize, est_ev: usize, est_ck: usize) -> Self {
-        let e = est_ev / P2 + 16;
-        let c = est_ck / P2 + 16;
+        let bytes = est_ev * (std::mem::size_of::<PRec>() + std::mem::size_of::<Slim>())
+            + est_ck * std::mem::size_of::<CRec>()
+            + (2 * P2 + P1) * 4096;
         Local {
             t,
-            pv: (0..P2).map(|_| Vec::with_capacity(e)).collect(),
-            sl: (0..P1).map(|_| Vec::with_capacity(e)).collect(),
-            ck: (0..P2).map(|_| Vec::with_capacity(c)).collect(),
+            pv: (0..P2).map(|_| Bucket::new()).collect(),
+            sl: (0..P1).map(|_| Bucket::new()).collect(),
+            ck: (0..P2).map(|_| Bucket::new()).collect(),
             dc: DateCache::new(),
+            arena: Arena::new(bytes),
         }
     }
 }
@@ -163,13 +168,12 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) 
         }
         let pkey = cx.links.person(hash(user));
         let b = bucket(pkey);
-        let v = &mut out.pv[b];
-        let i = v.len();
+        let i = out.pv[b].len();
         assert!(i < 1 << 24);
-        v.push(PRec { pkey, uptr: pack(user), ts: (ts - cx.ws) as u32, pc });
+        out.pv[b].push(PRec { pkey, uptr: pack(user), ts: (ts - cx.ws) as u32, pc }, &mut out.arena);
         meta = (meta & !META_INVALID) | i as u64 | (b as u64) << 24 | (out.t as u64) << 34;
     }
-    out.sl[(h >> 54) as usize].push(Slim { h, meta, ingest });
+    out.sl[(h >> 54) as usize].push(Slim { h, meta, ingest }, &mut out.arena);
 }
 
 #[inline(always)]
@@ -185,7 +189,7 @@ pub fn click_line(line: &'static [u8], f: &Fields<4>, cx: &Cx, out: &mut Local) 
         return;
     }
     let pkey = cx.links.person(hash(user));
-    out.ck[bucket(pkey)].push(CRec { pkey, cid: pack(cid), ts: (ts - (cx.ws - WEEK_MS)) as u32, camp });
+    out.ck[bucket(pkey)].push(CRec { pkey, cid: pack(cid), ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
 }
 
 #[inline(always)]

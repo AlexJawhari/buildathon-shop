@@ -256,5 +256,8 @@ fn populate(r: &[u8]) {
     const MADV_POPULATE_READ: i32 = 22;
     let a = r.as_ptr() as usize & !4095;
     let e = (r.as_ptr() as usize + r.len() + 4095) & !4095;
-    unsafe { libc::madvise(a as *mut _, e - a, MADV_POPULATE_READ) };
+    let rc = unsafe { libc::madvise(a as *mut _, e - a, MADV_POPULATE_READ) };
+    if rc != 0 && std::env::var_os("SHOP_DBG").is_some() {
+        eprintln!("populate failed: {}", std::io::Error::last_os_error());
+    }
 }

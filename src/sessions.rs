@@ -1,18 +1,23 @@
 //! Per-person sessionization, click credit/assists and aggregation.
 
+use crate::bucket::Bucket;
 use crate::ingest::*;
 use crate::util::*;
 
 const GAP_MS: i64 = 30 * 60 * 1000;
 pub const NO_CAT: u16 = u16::MAX;
 
-pub struct UserRow {
-    pub name: u64,
-    pub day: i32,
-    pub sessions: u32,
-    pub events: u32,
-    pub rev: u64,
-    pub cat: u16,
+/// user_daily rows, stored column-wise in PLAIN Parquet encoding as they are produced.
+#[derive(Default)]
+pub struct UserCols {
+    pub n: usize,
+    pub user: Vec<u8>,
+    pub day: Vec<u8>,
+    pub sessions: Vec<u8>,
+    pub events: Vec<u8>,
+    pub rev: Vec<u8>,
+    pub has_cat: Vec<bool>,
+    pub cat: Vec<u16>,
 }
 
 struct Sess {
@@ -28,7 +33,7 @@ pub struct State {
     pub nday: usize,
     pub organic: u32,
     pub camp: Vec<[u64; 4]>, // [(campaign, day)] -> sessions, purchasing, revenue, assisted
-    pub rows: Vec<UserRow>,
+    pub cols: UserCols,
     sess: Vec<Sess>,
     dfirst: Vec<usize>,
     covered: Vec<u32>,
@@ -45,34 +50,29 @@ pub struct State {
     csorted: Vec<CRec>,
 }
 
-/// Read-only view of a vector another thread filled.
-#[derive(Clone, Copy)]
-pub struct View<T>(pub *const T, pub usize);
-unsafe impl<T> Send for View<T> {}
-unsafe impl<T> Sync for View<T> {}
-impl<T> View<T> {
-    pub fn of(v: &Vec<T>) -> Self {
-        View(v.as_ptr(), v.len())
-    }
-    pub fn get(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.0, self.1) }
-    }
-}
-
 #[inline(always)]
 fn slot(pkey: u64, mask: usize) -> usize {
     ((pkey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize) & mask
 }
 
 impl State {
-    pub fn new(ws: i64, dbase: i64, nday: usize, ncamp: usize, ncat: usize) -> State {
+    pub fn new(ws: i64, dbase: i64, nday: usize, ncamp: usize, ncat: usize, est_rows: usize) -> State {
         State {
             ws,
             dbase,
             nday,
             organic: ncamp as u32,
             camp: vec![[0; 4]; (ncamp + 1) * nday],
-            rows: vec![],
+            cols: UserCols {
+                n: 0,
+                user: Vec::with_capacity(est_rows * 14),
+                day: Vec::with_capacity(est_rows * 4),
+                sessions: Vec::with_capacity(est_rows * 4),
+                events: Vec::with_capacity(est_rows * 4),
+                rev: Vec::with_capacity(est_rows * 8),
+                has_cat: Vec::with_capacity(est_rows),
+                cat: Vec::with_capacity(est_rows),
+            },
             sess: vec![],
             dfirst: vec![0; nday + 2],
             covered: vec![0; ncamp + 1],
@@ -103,14 +103,14 @@ impl State {
     }
 
     /// Group one person bucket's events and clicks per person and process each person.
-    pub fn bucket(&mut self, pvs: &[View<PRec>], cks: &[View<CRec>]) {
+    pub fn bucket(&mut self, pvs: &[&Bucket<PRec>], cks: &[&Bucket<CRec>]) {
         self.pkeys.clear();
         self.cnt.clear();
         self.recs.clear();
         self.table.clear();
         self.table.resize(4096, 0);
         for v in pvs {
-            for r in v.get() {
+            for r in v.slices().flatten() {
                 if r.pc == DEAD {
                     continue;
                 }
@@ -158,7 +158,7 @@ impl State {
         let mut ccnt = vec![0u32; np + 1];
         let mask = self.table.len() - 1;
         for v in cks {
-            for c in v.get() {
+            for c in v.slices().flatten() {
                 let mut s = slot(c.pkey, mask);
                 loop {
                     let e = self.table[s];
@@ -214,7 +214,19 @@ impl State {
             }
             self.cat_touched.clear();
         }
-        self.rows.push(UserRow { name, day, sessions, events, rev, cat });
+        let c = &mut self.cols;
+        let nm = unpack(name);
+        c.user.extend_from_slice(&(nm.len() as u32).to_le_bytes());
+        c.user.extend_from_slice(nm);
+        c.day.extend_from_slice(&day.to_le_bytes());
+        c.sessions.extend_from_slice(&sessions.to_le_bytes());
+        c.events.extend_from_slice(&events.to_le_bytes());
+        c.rev.extend_from_slice(&(rev as i64).to_le_bytes());
+        c.has_cat.push(cat != NO_CAT);
+        if cat != NO_CAT {
+            c.cat.push(cat);
+        }
+        c.n += 1;
     }
 
     fn person(&mut self, evs: &[PRec], cks: &[CRec]) {

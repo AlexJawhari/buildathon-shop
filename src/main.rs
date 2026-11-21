@@ -1,5 +1,6 @@
 //! Shopping Sessions pipeline: mmap CSVs, parse in parallel, dedup, sessionize, write Parquet.
 
+mod bucket;
 mod ingest;
 mod links;
 mod scan;
@@ -8,6 +9,7 @@ mod prof;
 mod sessions;
 mod util;
 
+use bucket::Bucket;
 use ingest::*;
 use scan::*;
 use parquet::*;
@@ -63,7 +65,7 @@ fn main() {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let tv = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
-            eprintln!("{:7.1} ms wall  cpu user {:7.1} sys {:7.1}  {what}", t0.elapsed().as_secs_f64() * 1e3, tv(ru.ru_utime), tv(ru.ru_stime));
+            eprintln!("{:7.1} ms wall  cpu user {:7.1} sys {:7.1} flt {}  {what}", t0.elapsed().as_secs_f64() * 1e3, tv(ru.ru_utime), tv(ru.ru_stime), ru.ru_minflt);
         }
     };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -166,7 +168,7 @@ fn main() {
     scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
     let next = AtomicUsize::new(0);
     let total = ev_chunks.len() + ck_chunks.len();
-    let mut locals: Vec<Local> = par(nt, |t| {
+    let locals: Vec<Local> = par(nt, |t| {
         let mut l = Local::new(t, est_ev, est_ck);
         let mut ix = Index::default();
         loop {
@@ -194,17 +196,13 @@ fn main() {
     lap("parse");
 
     // phase C: dedup by event id; losing copies are marked DEAD in their person bucket
-    struct Bases(Vec<Vec<*mut PRec>>);
-    unsafe impl Sync for Bases {}
-    let bases = Bases(locals.iter_mut().map(|l| l.pv.iter_mut().map(|v| v.as_mut_ptr()).collect()).collect());
     let next = AtomicUsize::new(0);
     par(nt, |_| {
         let mut table: Vec<u32> = vec![];
-        let bs = &bases;
         let kill = |meta: u64| {
             if meta & META_INVALID == 0 {
                 let (i, b, t) = ((meta & 0xFF_FFFF) as usize, ((meta >> 24) & 1023) as usize, ((meta >> 34) & 15) as usize);
-                unsafe { (*bs.0[t][b].add(i)).pc = DEAD };
+                unsafe { (*locals[t].pv[b].ptr(i)).pc = DEAD };
             }
         };
         loop {
@@ -218,8 +216,8 @@ fn main() {
             table.clear();
             table.resize(cap, 0);
             for (t, l) in locals.iter().enumerate() {
-                let v = &l.sl[p];
-                for (i, r) in v.iter().enumerate() {
+                let mut i = 0usize;
+                for r in l.sl[p].slices().flatten() {
                     let (h, meta, ing) = (r.h, r.meta, r.ingest);
                     let mut s = h as usize & mask;
                     loop {
@@ -229,7 +227,7 @@ fn main() {
                             break;
                         }
                         let e = e - 1;
-                        let o = &locals[(e >> 28) as usize].sl[p][(e & 0x0FFF_FFFF) as usize];
+                        let o = locals[(e >> 28) as usize].sl[p].get((e & 0x0FFF_FFFF) as usize);
                         if o.h == h && (o.meta >> 39) == (meta >> 39) {
                             if ing < o.ingest {
                                 kill(o.meta);
@@ -241,6 +239,7 @@ fn main() {
                         }
                         s = (s + 1) & mask;
                     }
+                    i += 1;
                 }
             }
         }
@@ -250,25 +249,23 @@ fn main() {
     // phase D: sessionize per person bucket, write user_daily parts
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
     std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
-    let pviews: Vec<Vec<View<PRec>>> = locals.iter().map(|l| l.pv.iter().map(View::of).collect()).collect();
-    let cviews: Vec<Vec<View<CRec>>> = locals.iter().map(|l| l.ck.iter().map(View::of).collect()).collect();
     let mut order: Vec<(usize, usize)> =
-        (0..P2).map(|b| (pviews.iter().map(|v| v[b].1).sum::<usize>() + cviews.iter().map(|v| v[b].1).sum::<usize>(), b)).collect();
+        (0..P2).map(|b| (locals.iter().map(|l| l.pv[b].len() + l.ck[b].len()).sum::<usize>(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
     let states: Vec<State> = par(nt, |t| {
-        let mut st = State::new(ws, dbase, nday, camps.len(), cats.len());
+        let mut st = State::new(ws, dbase, nday, camps.len(), cats.len(), est_ev * 3 / 20);
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= P2 {
                 break;
             }
             let b = order[i].1;
-            let pv: Vec<View<PRec>> = pviews.iter().map(|v| v[b]).collect();
-            let cv: Vec<View<CRec>> = cviews.iter().map(|v| v[b]).collect();
+            let pv: Vec<&Bucket<PRec>> = locals.iter().map(|l| &l.pv[b]).collect();
+            let cv: Vec<&Bucket<CRec>> = locals.iter().map(|l| &l.ck[b]).collect();
             st.bucket(&pv, &cv);
         }
-        write_user(&out.join("user_daily").join(format!("part-{t}.parquet")), &st.rows, &cats, t == 0);
+        write_user(&out.join("user_daily").join(format!("part-{t}.parquet")), &st.cols, &cats, t == 0);
         st
     });
     lap("sessions+user parquet");
@@ -304,19 +301,19 @@ fn main() {
         }
     }
     let n = rows.len();
-    let col = |name, ptype, conv, data: Vec<u8>| Col { name, ptype, conv, optional: false, data, nvalues: n };
+    let col = |name, ptype, conv, data| mkcol(n, name, ptype, conv, data);
     let [n0, n1, n2, n3] = nums;
     write(
         &out.join("campaign_daily").join("part-0.parquet"),
         n,
         &[
-            col("campaign_id", T_BYTES, Some(CONV_UTF8), ids),
-            col("channel", T_BYTES, Some(CONV_UTF8), chans),
-            col("day", T_I32, Some(CONV_DATE), days),
-            col("sessions", T_I64, None, n0),
-            col("purchasing_sessions", T_I64, None, n1),
-            col("revenue_cents", T_I64, None, n2),
-            col("assisted_sessions", T_I64, None, n3),
+            col("campaign_id", T_BYTES, Some(CONV_UTF8), &ids),
+            col("channel", T_BYTES, Some(CONV_UTF8), &chans),
+            col("day", T_I32, Some(CONV_DATE), &days),
+            col("sessions", T_I64, None, &n0),
+            col("purchasing_sessions", T_I64, None, &n1),
+            col("revenue_cents", T_I64, None, &n2),
+            col("assisted_sessions", T_I64, None, &n3),
         ],
     );
     lap("done");
@@ -326,44 +323,32 @@ fn main() {
     std::process::exit(0);
 }
 
-fn write_user(path: &Path, rows: &[UserRow], cats: &[&[u8]], force: bool) {
-    if rows.is_empty() && !force {
+fn write_user(path: &Path, c: &UserCols, cats: &[&[u8]], force: bool) {
+    if c.n == 0 && !force {
         return;
     }
-    let n = rows.len();
-    let (mut u, mut d, mut s, mut e, mut r) = (vec![], vec![], vec![], vec![], vec![]);
-    let mut valid = Vec::with_capacity(n);
-    let mut cv = vec![];
-    for x in rows {
-        let name = unpack(x.name);
-        u.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        u.extend_from_slice(name);
-        d.extend_from_slice(&x.day.to_le_bytes());
-        s.extend_from_slice(&x.sessions.to_le_bytes());
-        e.extend_from_slice(&x.events.to_le_bytes());
-        r.extend_from_slice(&(x.rev as i64).to_le_bytes());
-        if x.cat != NO_CAT {
-            let c = cats[x.cat as usize];
-            cv.extend_from_slice(&(c.len() as u32).to_le_bytes());
-            cv.extend_from_slice(c);
-            valid.push(true);
-        } else {
-            valid.push(false);
-        }
+    let n = c.n;
+    let mut cdata = def_levels(&c.has_cat);
+    for &k in &c.cat {
+        let name = cats[k as usize];
+        cdata.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        cdata.extend_from_slice(name);
     }
-    let mut cdata = def_levels(&valid);
-    cdata.extend_from_slice(&cv);
-    let col = |name, ptype, conv, data| Col { name, ptype, conv, optional: false, data, nvalues: n };
+    let col = |name, ptype, conv, data| mkcol(n, name, ptype, conv, data);
     write(
         path,
         n,
         &[
-            col("user_id", T_BYTES, Some(CONV_UTF8), u),
-            col("day", T_I32, Some(CONV_DATE), d),
-            col("sessions", T_I32, None, s),
-            col("events", T_I32, None, e),
-            col("revenue_cents", T_I64, None, r),
-            Col { name: "top_category", ptype: T_BYTES, conv: Some(CONV_UTF8), optional: true, data: cdata, nvalues: n },
+            col("user_id", T_BYTES, Some(CONV_UTF8), &c.user),
+            col("day", T_I32, Some(CONV_DATE), &c.day),
+            col("sessions", T_I32, None, &c.sessions),
+            col("events", T_I32, None, &c.events),
+            col("revenue_cents", T_I64, None, &c.rev),
+            Col { name: "top_category", ptype: T_BYTES, conv: Some(CONV_UTF8), optional: true, data: &cdata, nvalues: n },
         ],
     );
+}
+
+fn mkcol<'a>(n: usize, name: &'static str, ptype: i32, conv: Option<i32>, data: &'a [u8]) -> Col<'a> {
+    Col { name, ptype, conv, optional: false, data, nvalues: n }
 }
