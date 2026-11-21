@@ -16,8 +16,7 @@ pub const DEAD: u32 = u32::MAX; // pc value of a record killed by dedup
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PRec {
-    pub pkey: u64,
-    pub uptr: u64,
+    pub pid: u32,
     pub ts: u32,
     pub pc: u32,
 }
@@ -52,15 +51,15 @@ pub const META_INVALID: u64 = 1 << 38;
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CRec {
-    pub pkey: u64,
     pub cid: u64,
+    pub pid: u32,
     pub ts: u32,
     pub camp: u32,
 }
 
 #[inline(always)]
-pub fn bucket(pkey: u64) -> usize {
-    (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PB)) as usize
+pub fn bucket(pid: u32) -> usize {
+    pid as usize & (P2 - 1)
 }
 
 /// Open-addressing hash -> u32 map, built once, then read-only.
@@ -163,11 +162,11 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, uh: u64, cx: &Cx, out: &mu
             let Some(p) = parse_price(fl(6)) else { break 'v };
             pc |= p | (cx.prods.get(hash(prod)).unwrap_or(cx.unknown_cat) << 26);
         }
-        let pkey = cx.links.person(uh);
-        let b = bucket(pkey);
+        let pid = cx.links.pid(uh, user);
+        let b = bucket(pid);
         let i = out.pv[b].len();
         assert!(i < 1 << 24);
-        out.pv[b].push(PRec { pkey, uptr: pack(user), ts: (ts - cx.ws) as u32, pc }, &mut out.arena);
+        out.pv[b].push(PRec { pid, ts: (ts - cx.ws) as u32, pc }, &mut out.arena);
         meta = (meta & !META_INVALID) | i as u64 | (b as u64) << 24 | (out.t as u64) << 34;
     }
     out.sl[(h >> (64 - PB)) as usize].push(Slim { h, meta, ingest }, &mut out.arena);
@@ -185,8 +184,8 @@ pub fn click_line(line: &'static [u8], f: &Fields<4>, uh: u64, cx: &Cx, out: &mu
     if ts < cx.ws - WEEK_MS || ts >= cx.we {
         return;
     }
-    let pkey = cx.links.person(uh);
-    out.ck[bucket(pkey)].push(CRec { pkey, cid: pack(cid), ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
+    let pid = cx.links.pid(uh, user);
+    out.ck[bucket(pid)].push(CRec { cid: pack(cid), pid, ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
 }
 
 #[inline(always)]

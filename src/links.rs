@@ -1,6 +1,7 @@
 //! Linked IDs: a lock-free hash table of every ID in a valid link line, joined by a
-//! lock-free union-find whose root is always the byte-wise smallest string. After
-//! `finish`, a lookup gives the packed (ptr,len) of the person's name.
+//! lock-free union-find whose root is always the byte-wise smallest string. After `assign`, every slot holds a
+//! dense person id (+1); IDs first seen in events/clicks are added the same way, so one probe maps any user id to a person.
+//! `names[pid]` is the packed (ptr,len) of the person's name.
 
 use crate::util::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
@@ -15,6 +16,8 @@ pub struct Links {
     slots: Box<[Slot]>,
     parent: Box<[AtomicU32]>, // 0 = root, else parent index + 1
     mask: usize,
+    names: Box<[AtomicU64]>,
+    npid: AtomicU32,
 }
 
 fn zeroed<T>(n: usize) -> Box<[T]> {
@@ -27,9 +30,18 @@ fn zeroed<T>(n: usize) -> Box<[T]> {
 }
 
 impl Links {
+    /// `max_ids`: upper bound on distinct user IDs (links, events and clicks together).
     pub fn new(max_ids: usize) -> Links {
-        let cap = (max_ids * 5 / 4 + 16).next_power_of_two();
-        Links { slots: zeroed(cap), parent: zeroed(cap), mask: cap - 1 }
+        let cap = (max_ids * 23 / 20 + 16).next_power_of_two();
+        Links { slots: zeroed(cap), parent: zeroed(cap), mask: cap - 1, names: zeroed(cap), npid: AtomicU32::new(0) }
+    }
+
+    pub fn npid(&self) -> usize {
+        self.npid.load(Relaxed) as usize
+    }
+
+    pub fn name(&self, pid: usize) -> u64 {
+        self.names[pid].load(Relaxed)
     }
 
     fn insert(&self, h: u64, v: u64) -> usize {
@@ -103,26 +115,29 @@ impl Links {
         }
     }
 
-    /// Replace each slot's value by its root's value (parallel over a slot range).
-    pub fn flatten_read(&self, range: std::ops::Range<usize>, tmp: &[AtomicU64]) {
+    /// Step 1 (parallel over slot ranges): give every union-find root a person id.
+    pub fn assign_roots(&self, range: std::ops::Range<usize>, tmp: &[AtomicU32]) {
         for i in range {
-            if self.slots[i].k.load(Relaxed) != 0 {
-                let r = self.find(i);
-                tmp[i].store(self.slots[r].v.load(Relaxed), Relaxed);
+            if self.slots[i].k.load(Relaxed) != 0 && self.parent[i].load(Relaxed) == 0 {
+                let pid = self.npid.fetch_add(1, Relaxed);
+                self.names[pid as usize].store(self.slots[i].v.load(Relaxed), Relaxed);
+                tmp[i].store(pid + 1, Relaxed);
             }
         }
     }
-    pub fn flatten_write(&self, range: std::ops::Range<usize>, tmp: &[AtomicU64]) {
+    /// Step 2 (after step 1 finished everywhere): every slot takes its root's person id.
+    pub fn assign_all(&self, range: std::ops::Range<usize>, tmp: &[AtomicU32]) {
         for i in range {
             if self.slots[i].k.load(Relaxed) != 0 {
-                self.slots[i].v.store(tmp[i].load(Relaxed), Relaxed);
+                let r = self.find(i);
+                self.slots[i].v.store(tmp[r].load(Relaxed) as u64, Relaxed);
             }
         }
     }
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
-    pub fn tmp(&self) -> Box<[AtomicU64]> {
+    pub fn tmp(&self) -> Box<[AtomicU32]> {
         zeroed(self.slots.len())
     }
 
@@ -135,21 +150,43 @@ impl Links {
         }
     }
 
-    /// Person key for a user hash: linked persons are keyed by their name's packed
-    /// address with the top bit set, unlinked IDs by their own hash with it clear.
+    /// Person id of a user id (hash `h`, bytes `name`), adding the ID as a new person when unseen.
     #[inline(always)]
-    pub fn person(&self, h: u64) -> u64 {
+    pub fn pid(&self, h: u64, name: &[u8]) -> u32 {
         let mut i = (h as usize) & self.mask;
+        let mut probes = 0usize;
         loop {
             let s = &self.slots[i];
             let k = s.k.load(Relaxed);
             if k == h {
-                return s.v.load(Relaxed) | (1 << 63);
+                return Self::wait(s);
             }
             if k == 0 {
-                return h & !(1 << 63);
+                match s.k.compare_exchange(0, h, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let pid = self.npid.fetch_add(1, Relaxed);
+                        self.names[pid as usize].store(pack(name), Relaxed);
+                        s.v.store(pid as u64 + 1, Release);
+                        return pid;
+                    }
+                    Err(cur) if cur == h => return Self::wait(s),
+                    Err(_) => {}
+                }
             }
             i = (i + 1) & self.mask;
+            probes += 1;
+            assert!(probes <= self.mask, "user id table full");
+        }
+    }
+
+    #[inline(always)]
+    fn wait(s: &Slot) -> u32 {
+        loop {
+            let v = s.v.load(Acquire);
+            if v != 0 {
+                return (v - 1) as u32;
+            }
+            std::hint::spin_loop();
         }
     }
 }

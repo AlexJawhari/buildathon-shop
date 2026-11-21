@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 const SH: usize = 8;
+const PF: usize = 192; // bytes ahead of the write cursor to prefetch
 const BLK: usize = 1 << SH; // records per block
 
 const SLAB: usize = 1 << 20;
@@ -124,6 +125,8 @@ impl<T: Copy> Bucket<T> {
         unsafe {
             self.cur.write(v);
             self.cur = self.cur.add(1);
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_prefetch((self.cur as *const i8).add(PF), std::arch::x86_64::_MM_HINT_T0);
         }
         self.left -= 1;
         self.len += 1;

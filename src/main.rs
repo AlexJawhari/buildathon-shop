@@ -103,9 +103,18 @@ fn main() {
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
     let lk_files = csv_files(&data.join("links"));
-    let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128 << 10);
+    let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256 << 10);
     let lk_chunks = chunks(&lk_files, ch);
 
+    let est = |files: &[&'static [u8]]| -> usize {
+        // events or clicks per thread, from the average line length of the first non-empty file
+        let total: usize = files.iter().map(|f| f.len()).sum();
+        let Some(f) = files.iter().find(|f| f.len() > 4096) else { return 0 };
+        let sample = &f[..f.len().min(1 << 20)];
+        let lines = memchr::memchr_iter(b'\n', sample).count().max(1);
+        (total as f64 / (sample.len() as f64 / lines as f64) * 1.15) as usize / nt
+    };
+    let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
     // size the link table from the number of lines
     let next = AtomicUsize::new(0);
     let counts = par(nt, |_| {
@@ -123,7 +132,7 @@ fn main() {
     let cx = Cx {
         ws,
         we,
-        links: links::Links::new(nlines * 2),
+        links: links::Links::new(nlines * 2 + (est_ev + est_ck) * nt / 6 + 4096),
         prods: pmap,
         camps: cmap,
         unknown_cat: cat_id(b"unknown"),
@@ -145,23 +154,14 @@ fn main() {
     let tmp = cx.links.tmp();
     let cap = cx.links.capacity();
     let step = cap.div_ceil(nt);
-    par(nt, |t| cx.links.flatten_read(t * step..((t + 1) * step).min(cap), &tmp));
-    par(nt, |t| cx.links.flatten_write(t * step..((t + 1) * step).min(cap), &tmp));
+    par(nt, |t| cx.links.assign_roots(t * step..((t + 1) * step).min(cap), &tmp));
+    par(nt, |t| cx.links.assign_all(t * step..((t + 1) * step).min(cap), &tmp));
     drop(tmp);
 
     lap("links flattened");
     // phase B: parse events and clicks
     let ev_chunks = chunks(&ev_files, ch);
     let ck_chunks = chunks(&ck_files, ch);
-    let est = |files: &[&'static [u8]]| -> usize {
-        // events or clicks per thread, from the average line length of the first non-empty file
-        let total: usize = files.iter().map(|f| f.len()).sum();
-        let Some(f) = files.iter().find(|f| f.len() > 4096) else { return 0 };
-        let sample = &f[..f.len().min(1 << 20)];
-        let lines = memchr::memchr_iter(b'\n', sample).count().max(1);
-        (total as f64 / (sample.len() as f64 / lines as f64) * 1.15) as usize / nt
-    };
-    let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
     scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
     let pool_bytes = nt
         * (est_ev * (std::mem::size_of::<PRec>() + std::mem::size_of::<Slim>())
@@ -253,6 +253,7 @@ fn main() {
     let mut order: Vec<(usize, usize)> =
         (0..P2).map(|b| (locals.iter().map(|l| l.pv[b].len() + l.ck[b].len()).sum::<usize>(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    let nlocal = (cx.links.npid() + P2 - 1) >> PB;
     let next = AtomicUsize::new(0);
     let states: Vec<State> = par(nt, |t| {
         let mut st = State::new(ws, dbase, nday, camps.len(), cats.len(), est_ev * 3 / 20);
@@ -264,7 +265,7 @@ fn main() {
             let b = order[i].1;
             let pv: Vec<&Bucket<PRec>> = locals.iter().map(|l| &l.pv[b]).collect();
             let cv: Vec<&Bucket<CRec>> = locals.iter().map(|l| &l.ck[b]).collect();
-            st.bucket(&pv, &cv);
+            st.bucket(b, nlocal, &pv, &cv, &cx.links);
         }
         write_user(&out.join("user_daily").join(format!("part-{t}.parquet")), &st.cols, &cats, t == 0);
         st

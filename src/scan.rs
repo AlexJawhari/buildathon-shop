@@ -221,7 +221,7 @@ pub fn run_chunk<const NF: usize, const PRE: bool>(
     }
 }
 
-pub static NOPOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static NOPOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true); // per-chunk MADV_POPULATE_READ measured slower than plain faults
 
 /// Map the chunk's pages in one call instead of faulting them in 64 KB at a time.
 fn populate(r: &[u8]) {

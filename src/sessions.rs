@@ -41,18 +41,11 @@ pub struct State {
     cat_sum: Vec<u64>,
     cat_touched: Vec<u16>,
     // per-bucket scratch
-    table: Vec<u32>,
-    pkeys: Vec<u64>,
-    cnt: Vec<u32>,
-    recs: Vec<(u32, PRec)>,
+    off: Vec<u32>,
+    pos: Vec<u32>,
+    coff: Vec<u32>,
     sorted: Vec<PRec>,
-    crecs: Vec<(u32, CRec)>,
     csorted: Vec<CRec>,
-}
-
-#[inline(always)]
-fn slot(pkey: u64, mask: usize) -> usize {
-    ((pkey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize) & mask
 }
 
 impl State {
@@ -79,125 +72,82 @@ impl State {
             touched: vec![],
             cat_sum: vec![0; ncat],
             cat_touched: vec![],
-            table: vec![],
-            pkeys: vec![],
-            cnt: vec![],
-            recs: vec![],
+            off: vec![],
+            pos: vec![],
+            coff: vec![],
             sorted: vec![],
-            crecs: vec![],
             csorted: vec![],
         }
     }
 
-    fn grow(&mut self) {
-        let cap = (self.table.len() * 2).max(4096);
-        self.table.clear();
-        self.table.resize(cap, 0);
-        for (id, &k) in self.pkeys.iter().enumerate() {
-            let mut s = slot(k, cap - 1);
-            while self.table[s] != 0 {
-                s = (s + 1) & (cap - 1);
-            }
-            self.table[s] = id as u32 + 1;
-        }
-    }
-
-    /// Group one person bucket's events and clicks per person and process each person.
-    pub fn bucket(&mut self, pvs: &[&Bucket<PRec>], cks: &[&Bucket<CRec>]) {
-        let (ne, nc): (usize, usize) = (pvs.iter().map(|b| b.len()).sum(), cks.iter().map(|b| b.len()).sum());
-        self.pkeys.clear();
-        self.cnt.clear();
-        self.recs.clear();
-        self.recs.reserve(ne);
-        self.sorted.reserve(ne);
-        self.crecs.reserve(nc);
-        self.csorted.reserve(nc);
-        self.table.clear();
-        self.table.resize(4096, 0);
+    /// Group one person bucket's events and clicks per person (dense local id = pid >> PB) and process each person.
+    /// `nlocal` is the number of local ids, `names` maps pid to the packed name.
+    pub fn bucket(&mut self, b: usize, nlocal: usize, pvs: &[&Bucket<PRec>], cks: &[&Bucket<CRec>], names: &crate::links::Links) {
+        let nc: usize = cks.iter().map(|v| v.len()).sum();
+        // events: count per person, prefix sums, scatter
+        self.off.clear();
+        self.off.resize(nlocal + 1, 0);
         for v in pvs {
             for r in v.slices().flatten() {
-                if r.pc == DEAD {
-                    continue;
+                if r.pc != DEAD {
+                    self.off[(r.pid >> PB) as usize + 1] += 1;
                 }
-                if self.pkeys.len() * 2 >= self.table.len() {
-                    self.grow();
-                }
-                let mask = self.table.len() - 1;
-                let mut s = slot(r.pkey, mask);
-                let id = loop {
-                    let e = self.table[s];
-                    if e == 0 {
-                        let id = self.pkeys.len() as u32;
-                        self.pkeys.push(r.pkey);
-                        self.cnt.push(0);
-                        self.table[s] = id + 1;
-                        break id;
-                    }
-                    if self.pkeys[e as usize - 1] == r.pkey {
-                        break e - 1;
-                    }
-                    s = (s + 1) & mask;
-                };
-                self.cnt[id as usize] += 1;
-                self.recs.push((id, *r));
             }
         }
-        let np = self.pkeys.len();
-        if np == 0 {
-            return;
+        for i in 0..nlocal {
+            self.off[i + 1] += self.off[i];
         }
-        // counting sort by person id
-        let mut off = vec![0u32; np + 1];
-        for i in 0..np {
-            off[i + 1] = off[i] + self.cnt[i];
-        }
-        let mut pos = off.clone();
+        let live = self.off[nlocal] as usize;
+        self.pos.clear();
+        self.pos.extend_from_slice(&self.off[..nlocal]);
         self.sorted.clear();
-        self.sorted.resize(self.recs.len(), PRec { pkey: 0, uptr: 0, ts: 0, pc: 0 });
-        for &(id, r) in &self.recs {
-            self.sorted[pos[id as usize] as usize] = r;
-            pos[id as usize] += 1;
+        self.sorted.reserve(live);
+        unsafe { self.sorted.set_len(live) };
+        for v in pvs {
+            for r in v.slices().flatten() {
+                if r.pc != DEAD {
+                    let l = (r.pid >> PB) as usize;
+                    unsafe { *self.sorted.get_unchecked_mut(*self.pos.get_unchecked(l) as usize) = *r };
+                    self.pos[l] += 1;
+                }
+            }
         }
-        // clicks of persons that have events
-        self.crecs.clear();
-        let mut ccnt = vec![0u32; np + 1];
-        let mask = self.table.len() - 1;
+        // clicks
+        self.coff.clear();
+        self.coff.resize(nlocal + 1, 0);
         for v in cks {
             for c in v.slices().flatten() {
-                let mut s = slot(c.pkey, mask);
-                loop {
-                    let e = self.table[s];
-                    if e == 0 {
-                        break;
-                    }
-                    if self.pkeys[e as usize - 1] == c.pkey {
-                        ccnt[e as usize - 1] += 1;
-                        self.crecs.push((e - 1, *c));
-                        break;
-                    }
-                    s = (s + 1) & mask;
-                }
+                self.coff[(c.pid >> PB) as usize + 1] += 1;
             }
         }
-        let mut coff = vec![0u32; np + 1];
-        for i in 0..np {
-            coff[i + 1] = coff[i] + ccnt[i];
+        for i in 0..nlocal {
+            self.coff[i + 1] += self.coff[i];
         }
-        let mut cpos = coff.clone();
+        self.pos.clear();
+        self.pos.extend_from_slice(&self.coff[..nlocal]);
         self.csorted.clear();
-        self.csorted.resize(self.crecs.len(), CRec { pkey: 0, cid: 0, ts: 0, camp: 0 });
-        for &(id, c) in &self.crecs {
-            self.csorted[cpos[id as usize] as usize] = c;
-            cpos[id as usize] += 1;
+        self.csorted.reserve(nc);
+        unsafe { self.csorted.set_len(nc) };
+        for v in cks {
+            for c in v.slices().flatten() {
+                let l = (c.pid >> PB) as usize;
+                unsafe { *self.csorted.get_unchecked_mut(*self.pos.get_unchecked(l) as usize) = *c };
+                self.pos[l] += 1;
+            }
         }
         let mut sorted = std::mem::take(&mut self.sorted);
         let mut csorted = std::mem::take(&mut self.csorted);
-        for id in 0..np {
-            let evs = &mut sorted[off[id] as usize..off[id + 1] as usize];
-            let cks = &mut csorted[coff[id] as usize..coff[id + 1] as usize];
+        for l in 0..nlocal {
+            let (a, z) = (self.off[l] as usize, self.off[l + 1] as usize);
+            if a == z {
+                continue;
+            }
+            let pid = (l << PB) | b;
+            let evs = &mut sorted[a..z];
+            let cks = &mut csorted[self.coff[l] as usize..self.coff[l + 1] as usize];
             evs.sort_unstable_by_key(|r| r.ts);
             cks.sort_unstable_by_key(|r| r.ts);
-            self.person(evs, cks);
+            self.person(names.name(pid), evs, cks);
         }
         self.sorted = sorted;
         self.csorted = csorted;
@@ -234,11 +184,10 @@ impl State {
         c.n += 1;
     }
 
-    fn person(&mut self, evs: &[PRec], cks: &[CRec]) {
+    fn person(&mut self, name: u64, evs: &[PRec], cks: &[CRec]) {
         let nday = self.nday;
         let ws = self.ws;
         let cbase = ws - WEEK_MS;
-        let name = if evs[0].pkey >> 63 == 1 { evs[0].pkey & !(1 << 63) } else { evs[0].uptr };
         self.sess.clear();
         let (mut uday, mut us, mut ue, mut ur) = (-1i32, 0u32, 0u32, 0u64);
         let mut prev = u32::MAX;
