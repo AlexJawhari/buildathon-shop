@@ -1,5 +1,6 @@
 //! Append-only bucket storage carved from a per-thread, pre-faulted arena.
 //! Fresh pages are populated in one madvise call instead of one page fault each.
+//! No MADV_HUGEPAGE: direct compaction for huge pages cost more sys time than the saved TLB misses.
 
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -32,7 +33,6 @@ impl Pool {
                 );
                 if p != libc::MAP_FAILED {
                     base = p as usize;
-                    libc::madvise(p, cap, libc::MADV_HUGEPAGE);
                 }
             }
         }
