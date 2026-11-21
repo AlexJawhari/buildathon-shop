@@ -152,7 +152,7 @@ impl Links {
 
     /// Person id of a user id (hash `h`, bytes `name`), adding the ID as a new person when unseen.
     #[inline(always)]
-    pub fn pid(&self, h: u64, name: &[u8]) -> u32 {
+    pub fn pid(&self, h: u64, name: &[u8], arena: &mut crate::bucket::Arena) -> u32 {
         let mut i = (h as usize) & self.mask;
         let mut probes = 0usize;
         loop {
@@ -165,7 +165,7 @@ impl Links {
                 match s.k.compare_exchange(0, h, AcqRel, Acquire) {
                     Ok(_) => {
                         let pid = self.npid.fetch_add(1, Relaxed);
-                        self.names[pid as usize].store(pack(name), Relaxed);
+                        self.names[pid as usize].store(pack(arena.copy_bytes(name)), Relaxed);
                         s.v.store(pid as u64 + 1, Release);
                         return pid;
                     }

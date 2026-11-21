@@ -100,18 +100,19 @@ fn main() {
         cmap.insert(hash(c), i as u32);
     }
 
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
+    let rio = read_io();
+    let ev_files = csv_inputs(&data.join("events"), !rio);
+    let ck_files = csv_inputs(&data.join("clicks"), !rio);
     let lk_files = csv_files(&data.join("links"));
     let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256 << 10);
     let lk_chunks = chunks(&lk_files, ch);
 
-    let est = |files: &[&'static [u8]]| -> usize {
+    let est = |files: &[Input]| -> usize {
         // events or clicks per thread, from the average line length of the first non-empty file
-        let total: usize = files.iter().map(|f| f.len()).sum();
-        let Some(f) = files.iter().find(|f| f.len() > 4096) else { return 0 };
-        let sample = &f[..f.len().min(1 << 20)];
-        let lines = memchr::memchr_iter(b'\n', sample).count().max(1);
+        let total: usize = files.iter().map(|f| f.len).sum();
+        let Some(f) = files.iter().find(|f| f.len > 4096) else { return 0 };
+        let sample = f.sample();
+        let lines = memchr::memchr_iter(b'\n', &sample).count().max(1);
         (total as f64 / (sample.len() as f64 / lines as f64) * 1.15) as usize / nt
     };
     let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
@@ -160,12 +161,13 @@ fn main() {
 
     lap("links flattened");
     // phase B: parse events and clicks
-    let ev_chunks = chunks(&ev_files, ch);
-    let ck_chunks = chunks(&ck_files, ch);
+    let ev_chunks = input_chunks(&ev_files, ch);
+    let ck_chunks = input_chunks(&ck_files, ch);
     scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
     let pool_bytes = nt
         * (est_ev * (std::mem::size_of::<PRec>() + std::mem::size_of::<Slim>())
             + est_ck * std::mem::size_of::<CRec>()
+            + (est_ev / 6 + est_ck) * 16 // copied user and click ids
             + (2 * P2 + P1) * 4096
             + (2 << 20));
     let pool = bucket::Pool::new(pool_bytes);
@@ -174,20 +176,30 @@ fn main() {
     let locals: Vec<Local> = par(nt, |t| {
         pool.populate(t, nt);
         let mut l = Local::new(t, pool);
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= total {
                 return l;
             }
             if i < ev_chunks.len() {
-                run_chunk::<7, true>(ev_chunks[i], hash, |h| cx.links.prefetch(h), |ln, f, uh| event_line(ln, f, uh, &cx, &mut l));
+                let (fi, a, b) = ev_chunks[i];
+                let pre = |h| cx.links.prefetch(h);
+                let f = |ln: &'static [u8], fl: &_, uh| event_line(ln, fl, uh, &cx, &mut l);
+                if rio {
+                    run_region::<7, true>(read_region(&ev_files[fi], a, b, &mut buf), hash, pre, f);
+                } else {
+                    run_chunk::<7, true>((ev_files[fi].map, a, b), hash, pre, f);
+                }
             } else {
-                run_chunk::<4, true>(
-                    ck_chunks[i - ev_chunks.len()],
-                    hash,
-                    |h| cx.links.prefetch(h),
-                    |ln, f, uh| click_line(ln, f, uh, &cx, &mut l),
-                );
+                let (fi, a, b) = ck_chunks[i - ev_chunks.len()];
+                let pre = |h| cx.links.prefetch(h);
+                let f = |ln: &'static [u8], fl: &_, uh| click_line(ln, fl, uh, &cx, &mut l);
+                if rio {
+                    run_region::<4, true>(read_region(&ck_files[fi], a, b, &mut buf), hash, pre, f);
+                } else {
+                    run_chunk::<4, true>((ck_files[fi].map, a, b), hash, pre, f);
+                }
             }
         }
     });

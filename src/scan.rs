@@ -165,14 +165,25 @@ pub fn run_chunk<const NF: usize, const PRE: bool>(
     c: Chunk,
     hash_pre: impl Fn(&'static [u8]) -> u64,
     prefetch: impl Fn(u64),
-    mut f: impl FnMut(&'static [u8], &Fields<NF>, u64),
+    f: impl FnMut(&'static [u8], &Fields<NF>, u64),
 ) {
     let r = region(c);
+    if !NOPOP.load(std::sync::atomic::Ordering::Relaxed) && !r.is_empty() {
+        populate(r);
+    }
+    run_region::<NF, PRE>(r, hash_pre, prefetch, f)
+}
+
+/// Same, over the lines of an already loaded region.
+#[inline(always)]
+pub fn run_region<const NF: usize, const PRE: bool>(
+    r: &'static [u8],
+    hash_pre: impl Fn(&'static [u8]) -> u64,
+    prefetch: impl Fn(u64),
+    mut f: impl FnMut(&'static [u8], &Fields<NF>, u64),
+) {
     if r.is_empty() {
         return;
-    }
-    if !NOPOP.load(std::sync::atomic::Ordering::Relaxed) {
-        populate(r);
     }
     let len = r.len();
     let mut p = 0usize;

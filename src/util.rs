@@ -483,3 +483,135 @@ mod tests {
         }
     }
 }
+
+/// An input file that is either memory-mapped or read with pread (see `read_io`).
+pub struct Input {
+    pub fd: i32,
+    pub len: usize,
+    pub map: &'static [u8], // empty when not mapped
+}
+
+impl Input {
+    /// Up to 1 MB from the start of the file, for line-length sampling.
+    pub fn sample(&self) -> Vec<u8> {
+        if !self.map.is_empty() {
+            return self.map[..self.map.len().min(1 << 20)].to_vec();
+        }
+        let n = self.len.min(1 << 20);
+        let mut v = vec![0u8; n];
+        let got = unsafe { libc::pread(self.fd, v.as_mut_ptr() as *mut _, n, 0) };
+        v.truncate(got.max(0) as usize);
+        v
+    }
+}
+
+/// Default input method. pread avoids page-table walks on VMs but costs a copy; measured slower on bare metal.
+const DEFAULT_READ_IO: bool = false;
+
+/// True when events and clicks should be read with pread into per-thread buffers instead of mmap.
+/// `SHOP_IO=read|mmap` overrides DEFAULT_READ_IO.
+pub fn read_io() -> bool {
+    match std::env::var("SHOP_IO").as_deref() {
+        Ok("read") => true,
+        Ok("mmap") => false,
+        _ => DEFAULT_READ_IO,
+    }
+}
+
+pub fn csv_inputs(dir: &std::path::Path, map: bool) -> Vec<Input> {
+    let mut v: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "csv") && p.is_file())
+            .collect(),
+        Err(_) => vec![],
+    };
+    v.sort();
+    v.iter()
+        .map(|p| {
+            let f = File::open(p).unwrap_or_else(|e| panic!("open {p:?}: {e}"));
+            let len = f.metadata().unwrap().len() as usize;
+            let fd = std::os::unix::io::IntoRawFd::into_raw_fd(f);
+            let map = if map { mmap(p) } else { &[] };
+            Input { fd, len, map }
+        })
+        .collect()
+}
+
+/// (file index, start, end) pieces of about `size` bytes.
+pub fn input_chunks(files: &[Input], size: usize) -> Vec<(usize, usize, usize)> {
+    let mut out = vec![];
+    for (i, f) in files.iter().enumerate() {
+        let mut a = 0;
+        loop {
+            let b = (a + size).min(f.len);
+            out.push((i, a, b));
+            if b >= f.len {
+                break;
+            }
+            a = b;
+        }
+    }
+    out
+}
+
+fn pread_all(fd: i32, buf: &mut Vec<u8>, off: usize, want: usize) -> usize {
+    let start = buf.len();
+    buf.resize(start + want, 0);
+    let mut got = 0;
+    while got < want {
+        let n = unsafe { libc::pread(fd, buf[start + got..].as_mut_ptr() as *mut _, want - got, (off + got) as i64) };
+        if n <= 0 {
+            break;
+        }
+        got += n as usize;
+    }
+    buf.truncate(start + got);
+    got
+}
+
+/// Same lines as `scan::region`, read with pread into `buf`; the slice borrows `buf` and is valid until the next call.
+pub fn read_region(f: &Input, a: usize, b: usize, buf: &mut Vec<u8>) -> &'static [u8] {
+    const EXTRA: usize = 4096;
+    buf.clear();
+    let off0 = a.saturating_sub(1);
+    let want = (b - off0 + EXTRA).min(f.len - off0);
+    pread_all(f.fd, buf, off0, want);
+    let rel = |x: usize| x - off0; // file offset -> buffer index
+    // start of the first line owned by this chunk
+    let p = if a == 0 {
+        match memchr::memchr(b'\n', buf) {
+            Some(i) => i + 1,
+            None => return &[],
+        }
+    } else if buf[0] == b'\n' {
+        1
+    } else {
+        match memchr::memchr(b'\n', &buf[1..]) {
+            Some(i) => i + 2,
+            None => return &[],
+        }
+    };
+    // end: after the newline that ends the last line starting before b
+    let e = if b >= f.len {
+        buf.len()
+    } else if buf[rel(b) - 1] == b'\n' {
+        rel(b)
+    } else {
+        let mut from = rel(b);
+        loop {
+            if let Some(i) = memchr::memchr(b'\n', &buf[from..]) {
+                break from + i + 1;
+            }
+            from = buf.len();
+            if pread_all(f.fd, buf, off0 + from, 65536) == 0 {
+                break buf.len();
+            }
+        }
+    };
+    if p >= e {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(buf.as_ptr().add(p), e - p) }
+}

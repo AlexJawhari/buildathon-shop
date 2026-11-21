@@ -72,13 +72,33 @@ pub struct Arena {
     pool: &'static Pool,
     cur: usize,
     end: usize,
+    scur: usize, // separate slab for copied strings (no alignment)
+    send: usize,
 }
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
     pub fn new(pool: &'static Pool) -> Arena {
-        Arena { pool, cur: 0, end: 0 }
+        Arena { pool, cur: 0, end: 0, scur: 0, send: 0 }
+    }
+
+    /// Copy `b` into stable memory (the input buffer it came from is reused) and return the copy.
+    pub fn copy_bytes(&mut self, b: &[u8]) -> &'static [u8] {
+        if self.scur + b.len() > self.send {
+            let off = self.pool.next.fetch_add(SLAB, Relaxed);
+            if off + SLAB > self.pool.cap || b.len() > SLAB {
+                return Box::leak(b.to_vec().into_boxed_slice());
+            }
+            self.scur = self.pool.base + off;
+            self.send = self.scur + SLAB;
+        }
+        let p = self.scur as *mut u8;
+        self.scur += b.len();
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+            std::slice::from_raw_parts(p, b.len())
+        }
     }
 
     fn alloc<T>(&mut self, n: usize) -> *mut T {

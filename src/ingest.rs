@@ -162,7 +162,7 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, uh: u64, cx: &Cx, out: &mu
             let Some(p) = parse_price(fl(6)) else { break 'v };
             pc |= p | (cx.prods.get(hash(prod)).unwrap_or(cx.unknown_cat) << 26);
         }
-        let pid = cx.links.pid(uh, user);
+        let pid = cx.links.pid(uh, user, &mut out.arena);
         let b = bucket(pid);
         let i = out.pv[b].len();
         assert!(i < 1 << 24);
@@ -184,8 +184,9 @@ pub fn click_line(line: &'static [u8], f: &Fields<4>, uh: u64, cx: &Cx, out: &mu
     if ts < cx.ws - WEEK_MS || ts >= cx.we {
         return;
     }
-    let pid = cx.links.pid(uh, user);
-    out.ck[bucket(pid)].push(CRec { cid: pack(cid), pid, ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
+    let pid = cx.links.pid(uh, user, &mut out.arena);
+    let cid = pack(out.arena.copy_bytes(cid));
+    out.ck[bucket(pid)].push(CRec { cid, pid, ts: (ts - (cx.ws - WEEK_MS)) as u32, camp }, &mut out.arena);
 }
 
 #[inline(always)]
