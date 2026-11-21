@@ -58,28 +58,37 @@ impl Arena {
     }
 }
 
+/// One cache line of state per bucket: the write cursor lives here, so a push touches this line and the tail line only.
+#[repr(align(64))]
 pub struct Bucket<T> {
-    blocks: Vec<*mut T>,
+    cur: *mut T,
+    left: usize,
     len: usize,
+    blocks: Vec<*mut T>,
 }
 unsafe impl<T> Send for Bucket<T> {}
 unsafe impl<T> Sync for Bucket<T> {}
 
 impl<T: Copy> Bucket<T> {
     pub fn new() -> Self {
-        Bucket { blocks: Vec::new(), len: 0 }
+        Bucket { cur: std::ptr::null_mut(), left: 0, len: 0, blocks: Vec::new() }
     }
     pub fn len(&self) -> usize {
         self.len
     }
     #[inline(always)]
     pub fn push(&mut self, v: T, arena: &mut Arena) {
-        let i = self.len;
-        if i & (BLK - 1) == 0 {
-            self.blocks.push(arena.alloc::<T>(BLK));
+        if self.left == 0 {
+            self.cur = arena.alloc::<T>(BLK);
+            self.blocks.push(self.cur);
+            self.left = BLK;
         }
-        unsafe { self.blocks.get_unchecked(i >> SH).add(i & (BLK - 1)).write(v) };
-        self.len = i + 1;
+        unsafe {
+            self.cur.write(v);
+            self.cur = self.cur.add(1);
+        }
+        self.left -= 1;
+        self.len += 1;
     }
     #[inline(always)]
     pub fn ptr(&self, i: usize) -> *mut T {

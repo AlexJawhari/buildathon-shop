@@ -181,14 +181,14 @@ fn main() {
                     ev_chunks[i],
                     &mut ix,
                     |u| cx.links.prefetch(hash(u)),
-                    |ln, f| if mode == 0 { event_line(ln, f, &cx, &mut l) } else if mode == 2 { std::hint::black_box(ln[f[2].0 as usize]); },
+                    |ln, f| if mode == 0 || mode >= 11 { event_line(ln, f, &cx, &mut l) } else if mode == 2 { std::hint::black_box(ln[f[2].0 as usize]); },
                 );
             } else {
                 run_chunk::<4>(
                     ck_chunks[i - ev_chunks.len()],
                     &mut ix,
                     |u| cx.links.prefetch(hash(u)),
-                    |ln, f| if mode < 3 { click_line(ln, f, &cx, &mut l) },
+                    |ln, f| if mode < 3 || mode >= 11 { click_line(ln, f, &cx, &mut l) },
                 );
             }
         }

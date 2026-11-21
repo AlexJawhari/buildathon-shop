@@ -134,6 +134,7 @@ impl Local {
 
 #[inline(always)]
 pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) {
+    let md = crate::scan::MODE.load(std::sync::atomic::Ordering::Relaxed);
     let fl = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let id = fl(0);
     if id.is_empty() {
@@ -167,12 +168,18 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) 
             let Some(p) = parse_price(fl(6)) else { break 'v };
             pc |= p | (cx.prods.get(hash(prod)).unwrap_or(cx.unknown_cat) << 26);
         }
-        let pkey = cx.links.person(hash(user));
+        let pkey = if md == 11 { hash(user) } else { cx.links.person(hash(user)) };
         let b = bucket(pkey);
+        if md == 12 {
+            return;
+        }
         let i = out.pv[b].len();
         assert!(i < 1 << 24);
         out.pv[b].push(PRec { pkey, uptr: pack(user), ts: (ts - cx.ws) as u32, pc }, &mut out.arena);
         meta = (meta & !META_INVALID) | i as u64 | (b as u64) << 24 | (out.t as u64) << 34;
+    }
+    if md == 13 {
+        return;
     }
     out.sl[(h >> (64 - PB)) as usize].push(Slim { h, meta, ingest }, &mut out.arena);
 }
