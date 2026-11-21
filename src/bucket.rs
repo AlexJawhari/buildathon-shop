@@ -62,7 +62,7 @@ impl Pool {
     pub fn release(&self, i: usize, parts: usize) {
         let (p, n) = self.part(i, parts);
         if n > 0 {
-            unsafe { libc::munmap(p as *mut _, n) };
+            unsafe { libc::madvise(p as *mut _, n, libc::MADV_DONTNEED) };
         }
     }
 }

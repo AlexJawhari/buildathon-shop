@@ -142,22 +142,22 @@ fn main() {
     lap("setup");
     // phase A: links
     let next = AtomicUsize::new(0);
-    par(nt, |_| loop {
+    let fresh: Vec<Vec<u32>> = par(nt, |_| {
+        let mut fresh = Vec::new();
         loop {
-        let i = next.fetch_add(1, Relaxed);
-        if i >= lk_chunks.len() {
-            return;
-        }
-        run_chunk::<2, false>(lk_chunks[i], hash, |_| {}, |l, f, _| link_line(l, f, &cx));
+            let i = next.fetch_add(1, Relaxed);
+            if i >= lk_chunks.len() {
+                return fresh;
+            }
+            run_chunk::<2, false>(lk_chunks[i], hash, |_| {}, |l, f, _| link_line(l, f, &cx, &mut fresh));
         }
     });
     lap("links parsed");
     let tmp = cx.links.tmp();
-    let cap = cx.links.capacity();
-    let step = cap.div_ceil(nt);
-    par(nt, |t| cx.links.assign_roots(t * step..((t + 1) * step).min(cap), &tmp));
-    par(nt, |t| cx.links.assign_all(t * step..((t + 1) * step).min(cap), &tmp));
+    par(nt, |t| cx.links.assign_roots(&fresh[t], &tmp));
+    par(nt, |t| cx.links.assign_all(&fresh[t], &tmp));
     drop(tmp);
+    drop(fresh);
 
     lap("links flattened");
     // phase B: parse events and clicks

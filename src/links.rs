@@ -44,7 +44,8 @@ impl Links {
         self.names[pid].load(Relaxed)
     }
 
-    fn insert(&self, h: u64, v: u64) -> usize {
+    /// Slot of `h`, inserting it if absent; newly inserted slots are appended to `fresh`.
+    fn insert(&self, h: u64, v: u64, fresh: &mut Vec<u32>) -> usize {
         let mut i = (h as usize) & self.mask;
         loop {
             let s = &self.slots[i];
@@ -56,6 +57,7 @@ impl Links {
                 match s.k.compare_exchange(0, h, AcqRel, Acquire) {
                     Ok(_) => {
                         s.v.store(v, Release);
+                        fresh.push(i as u32);
                         return i;
                     }
                     Err(cur) if cur == h => return i,
@@ -107,18 +109,19 @@ impl Links {
     }
 
     /// Add one link line (both sides non-empty, already validated).
-    pub fn add(&self, a: &'static [u8], b: &'static [u8]) {
-        let ia = self.insert(hash(a), pack(a));
-        let ib = self.insert(hash(b), pack(b));
+    pub fn add(&self, a: &'static [u8], b: &'static [u8], fresh: &mut Vec<u32>) {
+        let ia = self.insert(hash(a), pack(a), fresh);
+        let ib = self.insert(hash(b), pack(b), fresh);
         if ia != ib {
             self.union(ia, ib);
         }
     }
 
-    /// Step 1 (parallel over slot ranges): give every union-find root a person id.
-    pub fn assign_roots(&self, range: std::ops::Range<usize>, tmp: &[AtomicU32]) {
-        for i in range {
-            if self.slots[i].k.load(Relaxed) != 0 && self.parent[i].load(Relaxed) == 0 {
+    /// Step 1 (parallel over the slots inserted by link lines): give every union-find root a person id.
+    pub fn assign_roots(&self, slots: &[u32], tmp: &[AtomicU32]) {
+        for &i in slots {
+            let i = i as usize;
+            if self.parent[i].load(Relaxed) == 0 {
                 let pid = self.npid.fetch_add(1, Relaxed);
                 self.names[pid as usize].store(self.slots[i].v.load(Relaxed), Relaxed);
                 tmp[i].store(pid + 1, Relaxed);
@@ -126,16 +129,12 @@ impl Links {
         }
     }
     /// Step 2 (after step 1 finished everywhere): every slot takes its root's person id.
-    pub fn assign_all(&self, range: std::ops::Range<usize>, tmp: &[AtomicU32]) {
-        for i in range {
-            if self.slots[i].k.load(Relaxed) != 0 {
-                let r = self.find(i);
-                self.slots[i].v.store(tmp[r].load(Relaxed) as u64, Relaxed);
-            }
+    pub fn assign_all(&self, slots: &[u32], tmp: &[AtomicU32]) {
+        for &i in slots {
+            let i = i as usize;
+            let r = self.find(i);
+            self.slots[i].v.store(tmp[r].load(Relaxed) as u64, Relaxed);
         }
-    }
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
     }
     pub fn tmp(&self) -> Box<[AtomicU32]> {
         zeroed(self.slots.len())
