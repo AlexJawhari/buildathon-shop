@@ -44,4 +44,18 @@ are noisy, so user+sys CPU is the main number. 20M events / 5M clicks, 143 event
 | MADV_POPULATE_READ on input chunks | no measurable change | kept (harmless) |
 | Per-thread arena (THP madvise + MADV_POPULATE_WRITE) for bucket blocks instead of Vec growth | fewer faults when THP is available; faults vary 120k-400k run to run with memory pressure | keep |
 | Streaming parquet columns, no row structs, no assembled file buffer | removes ~200 MB of temp memory at 20M | keep |
-| Docker (scorer flags, 8 cpus): 20M events | about 1.6 s wall under load, 8 MB image | |
+| Chunk size 2 MB -> 128 KB (index + region + hot buckets fit L2) | min CPU 6.3 s -> 5.0 s (32-256 KB all similar) | keep 128 KB |
+| Bucket write cursor in the bucket's own cache line (push touches 2 lines, not 3) | parse-phase user CPU about 3.2 s -> 2.3 s | keep |
+| Carry the quote count from line to line | iteration cost 34 -> about 25 ns/line | keep |
+| Parallel munmap of arenas and input maps before exit | exit teardown 150 ms -> about 15 ms at 20M | keep |
+| Per-thread arenas -> one shared pool with 1 MB slabs, populated in parallel | arenas were full for fast threads (57..110 MB used of 110) and spilled to the heap | keep |
+| Reserve stage-3 scratch from the bucket size | no visible change (noise) | keep |
+| PB (log2 partitions) 9 / 10 / 11 | 9 and 10 equal; 11 breaks Slim.meta packing | keep 10 |
+| Prefetch distance 6 / 12 / 24 lines | within noise | keep 12 |
+| MADV_POPULATE_READ per input chunk / MAP_POPULATE at map time | no change in CPU; MAP_POPULATE is serial (+50 ms setup) | keep per-chunk madvise (helps cold cache) |
+| Profile (NCPU=1, 20M): scan 0.6 s, line iteration+prefetch 0.85 s, event/click lines 2.0 s (link lookup 10 ns, slim record 20-25 ns, bucket push 10 ns per event), dedup 0.3 s, sessions+output 1.0 s | | next: Slim to 16 B, sort 8-byte keys per person |
+| Docker (scorer flags, 8 cpus): 20M events | 0.9-1.6 s wall on a box at load 12-19, 8 MB image | |
+
+Page-fault counts vary 70k-400k run to run on this box (swap in use, THP availability), so fault numbers are not comparable across runs.
+
+Not tried: PGO, AVX-512 scan, dictionary-encoded Parquet columns (output is 75 MB at 20M events, about 225 MB at 60M).
