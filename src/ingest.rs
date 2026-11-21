@@ -116,18 +116,14 @@ pub struct Local {
     pub arena: Arena,
 }
 impl Local {
-    /// `est_ev` / `est_ck`: expected events / clicks this thread will parse.
-    pub fn new(t: usize, est_ev: usize, est_ck: usize) -> Self {
-        let bytes = est_ev * (std::mem::size_of::<PRec>() + std::mem::size_of::<Slim>())
-            + est_ck * std::mem::size_of::<CRec>()
-            + (2 * P2 + P1) * 4096;
+    pub fn new(t: usize, pool: &'static Pool) -> Self {
         Local {
             t,
             pv: (0..P2).map(|_| Bucket::new()).collect(),
             sl: (0..P1).map(|_| Bucket::new()).collect(),
             ck: (0..P2).map(|_| Bucket::new()).collect(),
             dc: DateCache::new(),
-            arena: Arena::new(bytes),
+            arena: Arena::new(pool),
         }
     }
 }

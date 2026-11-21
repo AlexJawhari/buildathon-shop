@@ -1,60 +1,98 @@
 //! Append-only bucket storage carved from a per-thread, pre-faulted arena.
 //! Fresh pages are populated in one madvise call instead of one page fault each.
 
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
 const SH: usize = 8;
 const BLK: usize = 1 << SH; // records per block
 
-pub struct Arena {
-    base: *mut u8,
+const SLAB: usize = 1 << 20;
+
+/// One big anonymous mapping shared by all threads; threads claim 1 MB slabs from it.
+pub struct Pool {
+    base: usize,
     cap: usize,
-    used: usize,
+    next: AtomicUsize,
+}
+
+impl Pool {
+    pub fn new(cap: usize) -> &'static Pool {
+        let cap = (cap + SLAB - 1) & !(SLAB - 1);
+        let mut base = 0;
+        if cap > 0 {
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    cap,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                );
+                if p != libc::MAP_FAILED {
+                    base = p as usize;
+                    libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+                }
+            }
+        }
+        let cap = if base == 0 { 0 } else { cap };
+        Box::leak(Box::new(Pool { base, cap, next: AtomicUsize::new(0) }))
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        (self.next.load(Relaxed), self.cap)
+    }
+
+    fn part(&self, i: usize, parts: usize) -> (usize, usize) {
+        let slabs = self.cap / SLAB;
+        let (a, b) = (slabs * i / parts, slabs * (i + 1) / parts);
+        (self.base + a * SLAB, (b - a) * SLAB)
+    }
+
+    /// Fault in part `i` of `parts` with one call (parallel over threads).
+    pub fn populate(&self, i: usize, parts: usize) {
+        let (p, n) = self.part(i, parts);
+        if n > 0 {
+            unsafe { libc::madvise(p as *mut _, n, 23) }; // MADV_POPULATE_WRITE; older kernels ignore it
+        }
+    }
+
+    /// Give part `i` back to the kernel (call from `parts` threads so teardown runs in parallel).
+    pub fn release(&self, i: usize, parts: usize) {
+        let (p, n) = self.part(i, parts);
+        if n > 0 {
+            unsafe { libc::munmap(p as *mut _, n) };
+        }
+    }
+}
+
+/// Per-thread bump allocator over slabs of a Pool; falls back to the heap when the pool is used up.
+pub struct Arena {
+    pool: &'static Pool,
+    cur: usize,
+    end: usize,
 }
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    pub fn new(cap: usize) -> Arena {
-        let cap = (cap + 4095) & !4095;
-        if cap == 0 {
-            return Arena { base: std::ptr::null_mut(), cap: 0, used: 0 };
-        }
-        unsafe {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                cap,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            );
-            if p == libc::MAP_FAILED {
-                return Arena { base: std::ptr::null_mut(), cap: 0, used: 0 };
-            }
-            libc::madvise(p, cap, libc::MADV_HUGEPAGE);
-            let rc = libc::madvise(p, cap, 23); // MADV_POPULATE_WRITE; ignored by older kernels
-            if rc != 0 && std::env::var_os("SHOP_DBG").is_some() {
-                eprintln!("arena populate failed: {}", std::io::Error::last_os_error());
-            }
-            Arena { base: p as *mut u8, cap, used: 0 }
-        }
-    }
-
-    /// Give the arena's pages back to the kernel (callable from any thread once nothing reads it).
-    pub fn release(&self) {
-        if self.cap > 0 {
-            unsafe { libc::munmap(self.base as *mut _, self.cap) };
-        }
+    pub fn new(pool: &'static Pool) -> Arena {
+        Arena { pool, cur: 0, end: 0 }
     }
 
     fn alloc<T>(&mut self, n: usize) -> *mut T {
         let bytes = (n * std::mem::size_of::<T>() + 63) & !63;
-        if self.used + bytes <= self.cap {
-            let p = unsafe { self.base.add(self.used) };
-            self.used += bytes;
-            p as *mut T
-        } else {
-            unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(bytes, 64).unwrap()) as *mut T }
+        if self.cur + bytes > self.end {
+            let off = self.pool.next.fetch_add(SLAB, Relaxed);
+            if off + SLAB > self.pool.cap {
+                return unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(bytes, 64).unwrap()) as *mut T };
+            }
+            self.cur = self.pool.base + off;
+            self.end = self.cur + SLAB;
         }
+        let p = self.cur;
+        self.cur += bytes;
+        p as *mut T
     }
 }
 

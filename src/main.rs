@@ -164,10 +164,17 @@ fn main() {
     };
     let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
     scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
+    let pool_bytes = nt
+        * (est_ev * (std::mem::size_of::<PRec>() + std::mem::size_of::<Slim>())
+            + est_ck * std::mem::size_of::<CRec>()
+            + (2 * P2 + P1) * 4096
+            + (2 << 20));
+    let pool = bucket::Pool::new(pool_bytes);
     let next = AtomicUsize::new(0);
     let total = ev_chunks.len() + ck_chunks.len();
     let locals: Vec<Local> = par(nt, |t| {
-        let mut l = Local::new(t, est_ev, est_ck);
+        pool.populate(t, nt);
+        let mut l = Local::new(t, pool);
         let mut ix = Index::default();
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -192,6 +199,9 @@ fn main() {
         }
     });
     lap("parse");
+    if tm {
+        eprintln!("pool used/cap MB: {} / {}", pool.stats().0 >> 20, pool.stats().1 >> 20);
+    }
 
     // phase C: dedup by event id; losing copies are marked DEAD in their person bucket
     let next = AtomicUsize::new(0);
@@ -316,7 +326,7 @@ fn main() {
     );
     // spread the kernel's page teardown over all threads before exiting
     par(nt, |t| {
-        locals[t].arena.release();
+        pool.release(t, nt);
         unmap_inputs(t, nt);
     });
     lap("done");
