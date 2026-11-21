@@ -104,9 +104,14 @@ impl State {
 
     /// Group one person bucket's events and clicks per person and process each person.
     pub fn bucket(&mut self, pvs: &[&Bucket<PRec>], cks: &[&Bucket<CRec>]) {
+        let (ne, nc): (usize, usize) = (pvs.iter().map(|b| b.len()).sum(), cks.iter().map(|b| b.len()).sum());
         self.pkeys.clear();
         self.cnt.clear();
         self.recs.clear();
+        self.recs.reserve(ne);
+        self.sorted.reserve(ne);
+        self.crecs.reserve(nc);
+        self.csorted.reserve(nc);
         self.table.clear();
         self.table.resize(4096, 0);
         for v in pvs {
