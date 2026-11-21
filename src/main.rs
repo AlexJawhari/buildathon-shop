@@ -316,6 +316,11 @@ fn main() {
             col("assisted_sessions", T_I64, None, &n3),
         ],
     );
+    // spread the kernel's page teardown over all threads before exiting
+    par(nt, |t| {
+        locals[t].arena.release();
+        unmap_inputs(t, nt);
+    });
     lap("done");
     if profiling {
         prof::dump();

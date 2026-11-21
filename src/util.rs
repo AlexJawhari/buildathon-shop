@@ -329,7 +329,28 @@ pub fn parse_price(b: &[u8]) -> Option<u32> {
     }
 }
 
-/// Memory-map a file read-only; the mapping is never unmapped.
+static MAPS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Unmap the input files in `parts` interleaved slices; call `unmap_inputs(t, parts)` from `parts` threads
+/// so the kernel's teardown work is spread over cores instead of running serially at exit.
+pub fn unmap_inputs(t: usize, parts: usize) {
+    const SEG: usize = 32 << 20;
+    let maps = MAPS.lock().unwrap();
+    let mut k = 0;
+    for &(p, len) in maps.iter() {
+        let mut off = 0;
+        while off < len {
+            let n = SEG.min(len - off);
+            if k % parts == t {
+                unsafe { libc::munmap((p + off) as *mut _, n) };
+            }
+            k += 1;
+            off += n;
+        }
+    }
+}
+
+/// Memory-map a file read-only; the mapping stays until `unmap_inputs`.
 pub fn mmap(path: &std::path::Path) -> &'static [u8] {
     let f = File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let len = f.metadata().unwrap().len() as usize;
@@ -339,6 +360,7 @@ pub fn mmap(path: &std::path::Path) -> &'static [u8] {
     unsafe {
         let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
         assert!(p != libc::MAP_FAILED, "mmap {path:?}");
+        MAPS.lock().unwrap().push((p as usize, len));
         std::slice::from_raw_parts(p as *const u8, len)
     }
 }

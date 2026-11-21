@@ -39,6 +39,13 @@ impl Arena {
         }
     }
 
+    /// Give the arena's pages back to the kernel (callable from any thread once nothing reads it).
+    pub fn release(&self) {
+        if self.cap > 0 {
+            unsafe { libc::munmap(self.base as *mut _, self.cap) };
+        }
+    }
+
     fn alloc<T>(&mut self, n: usize) -> *mut T {
         let bytes = (n * std::mem::size_of::<T>() + 63) & !63;
         if self.used + bytes <= self.cap {
