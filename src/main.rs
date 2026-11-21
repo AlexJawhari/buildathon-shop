@@ -264,8 +264,17 @@ fn main() {
     lap("dedup");
 
     // phase D: sessionize per person bucket, write user_daily parts
-    std::fs::create_dir_all(out.join("user_daily")).unwrap();
-    std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
+    // A reused output dir may hold part files of an earlier run (a thread without rows writes no file), which
+    // would be read as duplicate rows: start every table folder empty of *.parquet.
+    for t in ["user_daily", "campaign_daily"] {
+        let d = out.join(t);
+        std::fs::create_dir_all(&d).unwrap();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "parquet") {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+    }
     let mut order: Vec<(usize, usize)> =
         (0..P2).map(|b| (locals.iter().map(|l| l.pv[b].len() + l.ck[b].len()).sum::<usize>(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
