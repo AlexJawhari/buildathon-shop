@@ -5,8 +5,9 @@ use crate::bucket::*;
 use crate::scan::Fields;
 use crate::util::*;
 
-pub const P1: usize = 1024; // event-id partitions (dedup)
-pub const P2: usize = 1024; // person partitions (sessionize)
+pub const PB: usize = 10; // log2 of the partition counts; at most 10 (the bucket index is packed in 10 bits of Slim.meta)
+pub const P1: usize = 1 << PB; // event-id partitions (dedup)
+pub const P2: usize = 1 << PB; // person partitions (sessionize)
 pub const WEEK_MS: i64 = 7 * DAY_MS;
 pub const DEAD: u32 = u32::MAX; // pc value of a record killed by dedup
 
@@ -59,7 +60,7 @@ pub struct CRec {
 
 #[inline(always)]
 pub fn bucket(pkey: u64) -> usize {
-    (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize
+    (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PB)) as usize
 }
 
 /// Open-addressing hash -> u32 map, built once, then read-only.
@@ -173,7 +174,7 @@ pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) 
         out.pv[b].push(PRec { pkey, uptr: pack(user), ts: (ts - cx.ws) as u32, pc }, &mut out.arena);
         meta = (meta & !META_INVALID) | i as u64 | (b as u64) << 24 | (out.t as u64) << 34;
     }
-    out.sl[(h >> 54) as usize].push(Slim { h, meta, ingest }, &mut out.arena);
+    out.sl[(h >> (64 - PB)) as usize].push(Slim { h, meta, ingest }, &mut out.arena);
 }
 
 #[inline(always)]

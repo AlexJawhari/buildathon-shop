@@ -103,7 +103,7 @@ fn main() {
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
     let lk_files = csv_files(&data.join("links"));
-    let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20);
+    let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128 << 10);
     let lk_chunks = chunks(&lk_files, ch);
 
     // size the link table from the number of lines
@@ -201,7 +201,7 @@ fn main() {
         let mut table: Vec<u32> = vec![];
         let kill = |meta: u64| {
             if meta & META_INVALID == 0 {
-                let (i, b, t) = ((meta & 0xFF_FFFF) as usize, ((meta >> 24) & 1023) as usize, ((meta >> 34) & 15) as usize);
+                let (i, b, t) = ((meta & 0xFF_FFFF) as usize, ((meta >> 24) & ((1 << PB) - 1)) as usize, ((meta >> 34) & 15) as usize);
                 unsafe { (*locals[t].pv[b].ptr(i)).pc = DEAD };
             }
         };
