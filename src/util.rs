@@ -182,6 +182,33 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
+    if (9..=16).contains(&n) {
+        // two overlapping 8-digit SWAR conversions: first 8 digits and last 8 digits
+        let ta = rd8(b, 0) ^ ZERO8;
+        let tc = rd8(b, n - 8) ^ ZERO8;
+        if !all_digits(ta) || !all_digits(tc) {
+            return None;
+        }
+        const P10: [u64; 9] = [1, 10, 100, 1000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+        let k = P10[n - 8];
+        return Some((parse8(ta) * k + parse8(tc) % k) as i64);
+    }
+    parse_f3_scalar(b)
+}
+
+/// Eight digit values (one per byte, first digit in the lowest byte) to their number.
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let x = (x & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+}
+
+fn parse_f3_scalar(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 0 {
+        return None;
+    }
     let mut i = 0;
     while i < n && b[i] == b'0' {
         i += 1;
@@ -463,6 +490,33 @@ mod tests {
                 v[i] = alphabet[(rnd() % alphabet.len() as u64) as usize];
             }
             assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn f3_swar_matches_scalar() {
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..3_000_000 {
+            let n = 1 + (rnd() % 24) as usize;
+            let mut v: Vec<u8> = (0..n).map(|_| b'0' + (rnd() % 10) as u8).collect();
+            if rnd() % 4 == 0 {
+                let i = (rnd() % n as u64) as usize;
+                v[i] = b"-.+eE x\x80"[(rnd() % 8) as usize];
+            }
+            if rnd() % 3 == 0 {
+                for c in v.iter_mut().take((rnd() % 8) as usize) {
+                    if c.is_ascii_digit() {
+                        *c = b'0';
+                    }
+                }
+            }
+            assert_eq!(parse_ts(&v), parse_f3_scalar(&v), "{:?}", String::from_utf8_lossy(&v));
         }
     }
 
