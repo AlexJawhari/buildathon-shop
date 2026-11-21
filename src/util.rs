@@ -134,7 +134,7 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
 #[inline(always)]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
-    if n == 20 || n == 25 {
+    if (n == 20 || n == 25) && b[10] == b'T' {
         if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
             return None;
         }
@@ -256,10 +256,7 @@ fn date_slow(b: &[u8]) -> Option<i64> {
 #[inline(always)]
 pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = b.len();
-    if n == 20 || n == 25 {
-        if b[10] != b'T' {
-            return None;
-        }
+    if (n == 20 || n == 25) && b[10] == b'T' {
         let a = rd8(b, 0);
         let c2 = u16::from_le_bytes([b[8], b[9]]);
         let idx = ((a ^ ((c2 as u64) << 40)).wrapping_mul(K0) >> 56) as usize;
@@ -440,13 +437,15 @@ mod tests {
     use super::*;
     #[test]
     fn fast_ts_matches_slow() {
-        let seeds: [&[u8]; 6] = [
+        let seeds: [&[u8]; 8] = [
             b"2026-10-03T23:58:10Z",
             b"2026-10-03T19:58:10-04:00",
             b"2028-02-29T00:00:00+05:30",
             b"1791071890000",
             b"2026-12-31T23:59:59-00:00",
             b"2027-06-15T12:34:56Z",
+            b"00000001791071890000",
+            b"0000000000001791071890000",
         ];
         let mut dc = DateCache::new();
         let mut x: u64 = 88172645463325252;
@@ -458,12 +457,21 @@ mod tests {
         };
         let alphabet = b"0123456789-:TZz+ ,\"\r./";
         for _ in 0..2_000_000 {
-            let mut v = seeds[(rnd() % 6) as usize].to_vec();
+            let mut v = seeds[(rnd() % 8) as usize].to_vec();
             for _ in 0..(rnd() % 3) {
                 let i = (rnd() % v.len() as u64) as usize;
                 v[i] = alphabet[(rnd() % alphabet.len() as u64) as usize];
             }
             assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn padded_f3_of_f1_length() {
+        let mut dc = DateCache::new();
+        for t in [&b"00000001791071890000"[..], b"0000000000001791071890000"] {
+            assert_eq!(parse_ts(t), Some(1791071890000));
+            assert_eq!(parse_ts_c(t, &mut dc), Some(1791071890000));
         }
     }
 
