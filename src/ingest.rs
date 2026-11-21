@@ -1,6 +1,7 @@
 //! Parsing of event and click lines into partitioned records.
 
 use crate::links::Links;
+use crate::scan::Fields;
 use crate::util::*;
 
 pub const P1: usize = 1024; // event-id partitions (dedup)
@@ -109,6 +110,7 @@ pub struct Local {
     pub pv: Vec<Vec<PRec>>,
     pub sl: Vec<Vec<Slim>>,
     pub ck: Vec<Vec<CRec>>,
+    pub dc: DateCache,
 }
 impl Local {
     pub fn new(t: usize, est_ev: usize, est_ck: usize) -> Self {
@@ -119,30 +121,27 @@ impl Local {
             pv: (0..P2).map(|_| Vec::with_capacity(e)).collect(),
             sl: (0..P1).map(|_| Vec::with_capacity(e)).collect(),
             ck: (0..P2).map(|_| Vec::with_capacity(c)).collect(),
+            dc: DateCache::new(),
         }
     }
 }
 
 #[inline(always)]
-pub fn event_line(line: &'static [u8], cx: &Cx, out: &mut Local) {
-    let mut f = [(0usize, 0usize); 7];
-    if !split(line, &mut f) {
-        return;
-    }
-    let fl = |i: usize| &line[f[i].0..f[i].1];
+pub fn event_line(line: &'static [u8], f: &Fields<7>, cx: &Cx, out: &mut Local) {
+    let fl = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let id = fl(0);
     if id.is_empty() {
         return;
     }
     let (h, chk) = hash_chk(id);
-    let ing = parse_ts(fl(3));
+    let ing = parse_ts_c(fl(3), &mut out.dc);
     let ingest = match ing {
         Some(ms) => (ms / 1000).clamp(0, u32::MAX as i64 - 1) as u32,
         None => u32::MAX,
     };
     let mut meta = ((chk >> 7) as u64) << 39 | META_INVALID;
     'v: {
-        let (Some(ts), Some(ing)) = (parse_ts(fl(2)), ing) else { break 'v };
+        let (Some(ts), Some(ing)) = (parse_ts_c(fl(2), &mut out.dc), ing) else { break 'v };
         if ts < cx.ws || ts >= cx.we || ing.saturating_sub(ts) > DAY_MS {
             break 'v;
         }
@@ -174,18 +173,14 @@ pub fn event_line(line: &'static [u8], cx: &Cx, out: &mut Local) {
 }
 
 #[inline(always)]
-pub fn click_line(line: &'static [u8], cx: &Cx, out: &mut Local) {
-    let mut f = [(0usize, 0usize); 4];
-    if !split(line, &mut f) {
-        return;
-    }
-    let fl = |i: usize| &line[f[i].0..f[i].1];
+pub fn click_line(line: &'static [u8], f: &Fields<4>, cx: &Cx, out: &mut Local) {
+    let fl = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let (cid, user) = (fl(0), fl(1));
     if cid.is_empty() || user.is_empty() {
         return;
     }
     let Some(camp) = cx.camps.get(hash(fl(2))) else { return };
-    let Some(ts) = parse_ts(fl(3)) else { return };
+    let Some(ts) = parse_ts_c(fl(3), &mut out.dc) else { return };
     if ts < cx.ws - WEEK_MS || ts >= cx.we {
         return;
     }
@@ -193,14 +188,9 @@ pub fn click_line(line: &'static [u8], cx: &Cx, out: &mut Local) {
     out.ck[bucket(pkey)].push(CRec { pkey, cid: pack(cid), ts: (ts - (cx.ws - WEEK_MS)) as u32, camp });
 }
 
-/// Returns the number of lines that were valid link lines (both sides non-empty).
 #[inline(always)]
-pub fn link_line(line: &'static [u8], cx: &Cx) {
-    let mut f = [(0usize, 0usize); 2];
-    if !split(line, &mut f) {
-        return;
-    }
-    let (a, b) = (&line[f[0].0..f[0].1], &line[f[1].0..f[1].1]);
+pub fn link_line(line: &'static [u8], f: &Fields<2>, cx: &Cx) {
+    let (a, b) = (&line[f[0].0 as usize..f[0].1 as usize], &line[f[1].0 as usize..f[1].1 as usize]);
     if a.is_empty() || b.is_empty() {
         return;
     }

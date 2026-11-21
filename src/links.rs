@@ -126,6 +126,15 @@ impl Links {
         zeroed(self.slots.len())
     }
 
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add((h as usize) & self.mask) as *const i8, _MM_HINT_T0);
+        }
+    }
+
     /// Person key for a user hash: linked persons are keyed by their name's packed
     /// address with the top bit set, unlinked IDs by their own hash with it clear.
     #[inline(always)]

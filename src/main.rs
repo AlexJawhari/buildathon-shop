@@ -2,11 +2,14 @@
 
 mod ingest;
 mod links;
+mod scan;
 mod parquet;
+mod prof;
 mod sessions;
 mod util;
 
 use ingest::*;
+use scan::*;
 use parquet::*;
 use sessions::*;
 use std::path::{Path, PathBuf};
@@ -50,8 +53,19 @@ fn read_pairs(path: &Path) -> Vec<(&'static [u8], &'static [u8])> {
 
 fn main() {
     let t0 = std::time::Instant::now();
+    let profiling = std::env::var_os("SHOP_PROF").is_some();
+    if profiling {
+        prof::start();
+    }
     let tm = std::env::var_os("SHOP_TIMING").is_some();
-    let lap = |what: &str| if tm { eprintln!("{:7.1} ms  {what}", t0.elapsed().as_secs_f64() * 1e3) };
+    let lap = |what: &str| {
+        if tm {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+            eprintln!("{:7.1} ms wall  cpu user {:7.1} sys {:7.1}  {what}", t0.elapsed().as_secs_f64() * 1e3, tv(ru.ru_utime), tv(ru.ru_stime));
+        }
+    };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out = PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -117,11 +131,14 @@ fn main() {
     // phase A: links
     let next = AtomicUsize::new(0);
     par(nt, |_| loop {
+        let mut ix = Index::default();
+        loop {
         let i = next.fetch_add(1, Relaxed);
         if i >= lk_chunks.len() {
             return;
         }
-        for_lines(lk_chunks[i], |l| link_line(l, &cx));
+        run_chunk::<2>(lk_chunks[i], &mut ix, |_| {}, |l, f| link_line(l, f, &cx));
+        }
     });
     lap("links parsed");
     let tmp = cx.links.tmp();
@@ -144,19 +161,33 @@ fn main() {
         (total as f64 / (sample.len() as f64 / lines as f64) * 1.15) as usize / nt
     };
     let (est_ev, est_ck) = (est(&ev_files), est(&ck_files));
+    let mode: u32 = std::env::var("SHOP_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    scan::MODE.store(mode, Relaxed);
+    scan::NOPOP.store(std::env::var_os("SHOP_NOPOP").is_some(), Relaxed);
     let next = AtomicUsize::new(0);
     let total = ev_chunks.len() + ck_chunks.len();
     let mut locals: Vec<Local> = par(nt, |t| {
         let mut l = Local::new(t, est_ev, est_ck);
+        let mut ix = Index::default();
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= total {
                 return l;
             }
             if i < ev_chunks.len() {
-                for_lines(ev_chunks[i], |ln| event_line(ln, &cx, &mut l));
+                run_chunk::<7>(
+                    ev_chunks[i],
+                    &mut ix,
+                    |u| cx.links.prefetch(hash(u)),
+                    |ln, f| if mode == 0 { event_line(ln, f, &cx, &mut l) } else if mode == 2 { std::hint::black_box(ln[f[2].0 as usize]); },
+                );
             } else {
-                for_lines(ck_chunks[i - ev_chunks.len()], |ln| click_line(ln, &cx, &mut l));
+                run_chunk::<4>(
+                    ck_chunks[i - ev_chunks.len()],
+                    &mut ix,
+                    |u| cx.links.prefetch(hash(u)),
+                    |ln, f| if mode < 3 { click_line(ln, f, &cx, &mut l) },
+                );
             }
         }
     });
@@ -289,6 +320,9 @@ fn main() {
         ],
     );
     lap("done");
+    if profiling {
+        prof::dump();
+    }
     std::process::exit(0);
 }
 
