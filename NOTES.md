@@ -82,7 +82,7 @@ Each 4 KB fault costs about 4-5 us here, so touched memory is the sys-time cost.
 
 | Idea | Result | Verdict |
 | --- | --- | --- |
-| Drop MADV_HUGEPAGE on the pool | THP was only partly granted (368 MB of 1.38 GB RSS huge, the rest after compaction stalls); sys 2.5 -> 1.4 s; 7.11 -> 5.52 s CPU (5 runs), wall 0.94 -> 0.67 s | keep (b7f3aaa). Risk: on a host with free contiguous memory THP may win; decide by a scorer A/B |
+| Drop MADV_HUGEPAGE on the pool | THP was only partly granted (368 MB of 1.38 GB RSS huge, the rest after compaction stalls); sys 2.5 -> 1.4 s; 7.11 -> 5.52 s CPU (5 runs), wall 0.94 -> 0.67 s | REVERTED. Scorer: b7f3aaa 1.22 s vs 693acdd 1.03 s, so huge pages win on the scorer machine; local box is a bad proxy for THP |
 | MADV_POPULATE_WRITE off (SHOP_NOPOP=1) with no THP | 5.27 vs 5.24 s CPU | drop (no change) |
 | SHOP_IO=mmap vs pread (no THP) | mmap about 0.5 s less CPU locally (sys 0.6 vs 1.4 s, user +0.3 s) | not changed: pread is the default chosen for the scorer VM (round 2); needs a scorer A/B to flip |
 | pread without zero-fill of the chunk buffer (set_len instead of resize) | 5.36 vs 5.34 s CPU | drop (memset is cheap) |
