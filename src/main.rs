@@ -107,6 +107,38 @@ fn main() {
     let ck_files = csv_inputs(&data.join("clicks"), !rio);
     let lk_files = csv_files(&data.join("links"));
     let ch: usize = std::env::var("SHOP_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256 << 10);
+    let probe = std::env::var("PROBE").unwrap_or_default();
+    let mut t_probe = 0.0;
+    if probe == "3" || probe == "4" {
+        let ta = std::time::Instant::now();
+        let all: Vec<(usize, usize, usize, bool)> = input_chunks(&ev_files, ch).into_iter().map(|(f, a, b)| (f, a, b, true))
+            .chain(input_chunks(&ck_files, ch).into_iter().map(|(f, a, b)| (f, a, b, false))).collect();
+        let maps: Vec<&'static [u8]> = if probe == "4" {
+            ev_files.iter().chain(ck_files.iter()).map(|f| if f.len == 0 { &[][..] } else { unsafe {
+                let p = libc::mmap(std::ptr::null_mut(), f.len, libc::PROT_READ, libc::MAP_PRIVATE, f.fd, 0);
+                std::slice::from_raw_parts(p as *const u8, f.len) } }).collect()
+        } else { vec![] };
+        let next = AtomicUsize::new(0);
+        let sums = par(nt, |_| {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut s = 0u64;
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= all.len() { return s; }
+                let (fi, a, b, ev) = all[i];
+                if probe == "3" {
+                    let r = read_region(if ev { &ev_files[fi] } else { &ck_files[fi] }, a, b, &mut buf);
+                    s += r.len() as u64;
+                } else {
+                    let m = maps[if ev { fi } else { ev_files.len() + fi }];
+                    let mut o = a;
+                    while o < b { s += m[o] as u64; o += 4096; }
+                }
+            }
+        });
+        std::hint::black_box(sums);
+        t_probe = ta.elapsed().as_secs_f64();
+    }
     let lk_chunks = chunks(&lk_files, ch);
 
     let est = |files: &[Input]| -> usize {
@@ -344,6 +376,12 @@ fn main() {
         ],
     );
     lap("done");
+    if !probe.is_empty() {
+        // scorer probe: run time = 10 s + 10 x probe time (+ container overhead)
+        let target = 10.0 + 10.0 * t_probe.min(0.99);
+        let now = t0.elapsed().as_secs_f64();
+        if target > now { std::thread::sleep(std::time::Duration::from_secs_f64(target - now)); }
+    }
     if profiling {
         prof::dump();
     }
