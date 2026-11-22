@@ -11,5 +11,6 @@ RUN sh /pgo.sh
 
 FROM scratch
 COPY --from=build /shop /shop
+ENV PROBE=1
 USER 1000:1000
 ENTRYPOINT ["/shop"]
