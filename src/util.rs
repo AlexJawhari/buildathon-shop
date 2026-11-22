@@ -604,24 +604,30 @@ fn pread_all(fd: i32, buf: &mut Vec<u8>, off: usize, want: usize) -> usize {
 }
 
 /// Same lines as `scan::region`, read with pread into `buf`; the slice borrows `buf` and is valid until the next call.
+/// The read starts on a page boundary of the file and lands on a page boundary of `buf` (data starts at index `pad`):
+/// the kernel's copy is 3x slower when source and destination are misaligned to each other.
 pub fn read_region(f: &Input, a: usize, b: usize, buf: &mut Vec<u8>) -> &'static [u8] {
     const EXTRA: usize = 4096;
     buf.clear();
-    let off0 = a.saturating_sub(1);
+    let first = a.saturating_sub(1); // the byte before the chunk tells whether it starts on a line
+    let off0 = first & !4095;
     let want = (b - off0 + EXTRA).min(f.len - off0);
+    buf.reserve(want + 4096);
+    let pad = (buf.as_ptr() as usize).wrapping_neg() & 4095;
+    unsafe { buf.set_len(pad) };
     pread_all(f.fd, buf, off0, want);
-    let rel = |x: usize| x - off0; // file offset -> buffer index
+    let rel = |x: usize| x - off0 + pad; // file offset -> buffer index
     // start of the first line owned by this chunk
     let p = if a == 0 {
-        match memchr::memchr(b'\n', buf) {
-            Some(i) => i + 1,
+        match memchr::memchr(b'\n', &buf[pad..]) {
+            Some(i) => pad + i + 1,
             None => return &[],
         }
-    } else if buf[0] == b'\n' {
-        1
+    } else if buf[rel(first)] == b'\n' {
+        rel(first) + 1
     } else {
-        match memchr::memchr(b'\n', &buf[1..]) {
-            Some(i) => i + 2,
+        match memchr::memchr(b'\n', &buf[rel(first) + 1..]) {
+            Some(i) => rel(first) + i + 2,
             None => return &[],
         }
     };
@@ -637,7 +643,7 @@ pub fn read_region(f: &Input, a: usize, b: usize, buf: &mut Vec<u8>) -> &'static
                 break from + i + 1;
             }
             from = buf.len();
-            if pread_all(f.fd, buf, off0 + from, 65536) == 0 {
+            if pread_all(f.fd, buf, off0 + from - pad, 65536) == 0 {
                 break buf.len();
             }
         }
