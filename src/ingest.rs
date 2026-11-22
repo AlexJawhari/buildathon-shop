@@ -5,7 +5,7 @@ use crate::bucket::*;
 use crate::scan::Fields;
 use crate::util::*;
 
-pub const PB: usize = 10; // log2 of the partition counts; at most 10 (the bucket index is packed in 10 bits of Slim.meta)
+pub const PB: usize = 8; // log2 of the partition counts; at most 10 (the bucket index is packed in 10 bits of Slim.meta)
 pub const P1: usize = 1 << PB; // event-id partitions (dedup)
 pub const P2: usize = 1 << PB; // person partitions (sessionize)
 pub const WEEK_MS: i64 = 7 * DAY_MS;
