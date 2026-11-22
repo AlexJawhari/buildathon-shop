@@ -590,16 +590,16 @@ pub fn input_chunks(files: &[Input], size: usize) -> Vec<(usize, usize, usize)> 
 
 fn pread_all(fd: i32, buf: &mut Vec<u8>, off: usize, want: usize) -> usize {
     let start = buf.len();
-    buf.resize(start + want, 0);
+    buf.reserve(want);
     let mut got = 0;
     while got < want {
-        let n = unsafe { libc::pread(fd, buf[start + got..].as_mut_ptr() as *mut _, want - got, (off + got) as i64) };
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().add(start + got) as *mut _, want - got, (off + got) as i64) };
         if n <= 0 {
             break;
         }
         got += n as usize;
     }
-    buf.truncate(start + got);
+    unsafe { buf.set_len(start + got) };
     got
 }
 
