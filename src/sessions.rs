@@ -46,7 +46,7 @@ pub struct State {
     off: Vec<u32>,
     pos: Vec<u32>,
     coff: Vec<u32>,
-    sorted: Vec<PRec>,
+    sorted: Vec<u64>, // ts << 32 | pc
     csorted: Vec<CRec>,
 }
 
@@ -110,7 +110,7 @@ impl State {
             for r in v.slices().flatten() {
                 if r.pc != DEAD {
                     let l = (r.pid >> PB) as usize;
-                    unsafe { *self.sorted.get_unchecked_mut(*self.pos.get_unchecked(l) as usize) = *r };
+                    unsafe { *self.sorted.get_unchecked_mut(*self.pos.get_unchecked(l) as usize) = (r.ts as u64) << 32 | r.pc as u64 };
                     self.pos[l] += 1;
                 }
             }
@@ -148,7 +148,7 @@ impl State {
             let pid = (l << PB) | b;
             let evs = &mut sorted[a..z];
             let cks = &mut csorted[self.coff[l] as usize..self.coff[l + 1] as usize];
-            evs.sort_unstable_by_key(|r| r.ts);
+            evs.sort_unstable();
             cks.sort_unstable_by_key(|r| r.ts);
             self.person(names.name(pid), evs, cks);
         }
@@ -184,7 +184,7 @@ impl State {
         c.n += 1;
     }
 
-    fn person(&mut self, name: u64, evs: &[PRec], cks: &[CRec]) {
+    fn person(&mut self, name: u64, evs: &[u64], cks: &[CRec]) {
         let nday = self.nday;
         let ws = self.ws;
         let cbase = ws - WEEK_MS;
@@ -192,7 +192,8 @@ impl State {
         let first_row = self.cols.n;
         let (mut uday, mut us, mut ue, mut ur) = (-1i32, 0u32, 0u32, 0u64);
         let mut prev = u32::MAX;
-        for e in evs {
+        for &k in evs {
+            let e = PRec { pid: 0, ts: (k >> 32) as u32, pc: k as u32 };
             if prev == u32::MAX || (e.ts - prev) as i64 > GAP_MS {
                 let start = ws + e.ts as i64;
                 let day = (start.div_euclid(DAY_MS) - self.dbase) as i32;
