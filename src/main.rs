@@ -162,7 +162,6 @@ fn main() {
     drop(fresh);
 
     lap("links flattened");
-    let t_links = t0.elapsed().as_secs_f64();
     // phase B: parse events and clicks
     let ev_chunks = input_chunks(&ev_files, ch);
     let ck_chunks = input_chunks(&ck_files, ch);
@@ -209,7 +208,6 @@ fn main() {
         }
     });
     lap("parse");
-    let t_parse = t0.elapsed().as_secs_f64();
     if tm {
         eprintln!("pool used/cap MB: {} / {}", pool.stats().0 >> 20, pool.stats().1 >> 20);
     }
@@ -264,7 +262,6 @@ fn main() {
         }
     });
     lap("dedup");
-    let t_dedup = t0.elapsed().as_secs_f64();
 
     // phase D: sessionize per person bucket, write user_daily parts
     // A reused output dir may hold part files of an earlier run (a thread without rows writes no file), which
@@ -347,17 +344,6 @@ fn main() {
         ],
     );
     lap("done");
-    if let Ok(m) = std::env::var("PROBE") {
-        // scorer timing probe: sleep until 10 s + encoded phase times, so the reported time carries them
-        let t_done = t0.elapsed().as_secs_f64();
-        let cs = |d: f64| (d * 100.0).round().clamp(0.0, 99.0);
-        let (a, b) = if m == "1" { (t_parse, t_dedup - t_parse) } else { (t_done - t_dedup, t_links) };
-        let target = 10.0 + 0.1 * cs(a) + 0.001 * cs(b);
-        let now = t0.elapsed().as_secs_f64();
-        if target > now {
-            std::thread::sleep(std::time::Duration::from_secs_f64(target - now));
-        }
-    }
     if profiling {
         prof::dump();
     }
