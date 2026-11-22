@@ -68,7 +68,7 @@ unsafe fn block(p: *const u8) -> (u64, u64, u64) {
 /// `buf` must have at least 128 readable bytes at `p`; bytes at or after `avail` must not be '\n', ',' or '"'
 /// (zero padding), and `avail` is the number of real bytes.
 #[inline(always)]
-unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Option<Fields<NF>>) {
+unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize, f: &mut Fields<NF>) -> (usize, bool) {
     let (c0, n0, q0) = block(p);
     let (c1, n1, q1);
     let l;
@@ -82,7 +82,7 @@ unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Opti
             l = 64 + n1.trailing_zeros() as usize;
         } else {
             // no newline within 128 bytes: last line without '\n', or a long line
-            return slow_line::<NF>(p, avail);
+            return slow_line::<NF>(p, avail, f);
         }
     }
     let (cm0, cm1, qm0, qm1) = if l < 64 {
@@ -94,32 +94,24 @@ unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Opti
     };
     let _ = n1;
     if (cm0.count_ones() + cm1.count_ones()) as usize != NF - 1 {
-        return (l, None);
+        return (l, false);
     }
-    let mut pos = [0u32; 16];
-    let mut k = 0;
-    let mut m = cm0;
-    while m != 0 {
-        pos[k] = m.trailing_zeros();
-        m &= m - 1;
-        k += 1;
+    let (mut k, mut start) = (0usize, 0u32);
+    for (mut m, base) in [(cm0, 0u32), (cm1, 64)] {
+        while m != 0 {
+            let e = base + m.trailing_zeros();
+            *f.get_unchecked_mut(k) = (start, e);
+            start = e + 1;
+            k += 1;
+            m &= m - 1;
+        }
     }
-    m = cm1;
-    while m != 0 {
-        pos[k] = 64 + m.trailing_zeros();
-        m &= m - 1;
-        k += 1;
-    }
-    let mut f: Fields<NF> = [(0, 0); NF];
-    for i in 0..NF {
-        f[i].0 = if i == 0 { 0 } else { pos[i - 1] + 1 };
-        f[i].1 = if i < NF - 1 { pos[i] } else { l as u32 };
-    }
+    *f.get_unchecked_mut(k) = (start, l as u32);
     let nq = qm0.count_ones() + qm1.count_ones();
-    if nq != 0 && !strip_quotes_masks::<NF>(&mut f, cm0 as u128 | (cm1 as u128) << 64, qm0 as u128 | (qm1 as u128) << 64, l, nq) {
-        return (l, None);
+    if nq != 0 && !strip_quotes_masks::<NF>(f, cm0 as u128 | (cm1 as u128) << 64, qm0 as u128 | (qm1 as u128) << 64, l, nq) {
+        return (l, false);
     }
-    (l, Some(f))
+    (l, true)
 }
 
 #[inline(always)]
@@ -153,18 +145,17 @@ fn strip_quotes_masks<const NF: usize>(f: &mut Fields<NF>, cm: u128, qm: u128, l
 /// Lines with no newline in 128 bytes: find it the slow way (or take the rest of the data).
 #[cold]
 #[inline(never)]
-unsafe fn slow_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Option<Fields<NF>>) {
+unsafe fn slow_line<const NF: usize>(p: *const u8, avail: usize, g: &mut Fields<NF>) -> (usize, bool) {
     let rest = std::slice::from_raw_parts(p, avail);
     let l = memchr::memchr(b'\n', rest).unwrap_or(avail);
     let mut f = [(0usize, 0usize); NF];
     if split::<NF>(&rest[..l], &mut f) {
-        let mut g: Fields<NF> = [(0, 0); NF];
         for i in 0..NF {
             g[i] = (f[i].0 as u32, f[i].1 as u32);
         }
-        (l, Some(g))
+        (l, true)
     } else {
-        (l, None)
+        (l, false)
     }
 }
 
@@ -201,14 +192,16 @@ pub fn run_region<const NF: usize, const PRE: bool>(
     let mut p = 0usize;
     // lines whose 128-byte window would run past the region go through a zero-padded copy
     let tail_start = len.saturating_sub(128);
-    let mut batch: [(u32, Fields<NF>, u64); BATCH] = [(0, [(0, 0); NF], 0); BATCH];
+    let mut bf: [Fields<NF>; BATCH] = [[(0, 0); NF]; BATCH];
+    let mut bq = [(0u32, 0u64); BATCH];
     let mut bn;
     while p < tail_start {
         bn = 0;
         let mut q = p;
         while bn < BATCH && q < tail_start {
-            let (l, fl) = unsafe { scan_line::<NF>(r.as_ptr().add(q), len - q) };
-            if let Some(fl) = fl {
+            let (l, ok) = unsafe { scan_line::<NF>(r.as_ptr().add(q), len - q, &mut bf[bn]) };
+            if ok {
+                let fl = &bf[bn];
                 let uh = if PRE {
                     let u = &r[q + fl[1].0 as usize..q + fl[1].1 as usize];
                     let h = hash_pre(u);
@@ -221,13 +214,13 @@ pub fn run_region<const NF: usize, const PRE: bool>(
                 } else {
                     0
                 };
-                batch[bn] = (q as u32, fl, uh);
+                bq[bn] = (q as u32, uh);
                 bn += 1;
             }
             q += l + 1;
         }
-        for b in &batch[..bn] {
-            f(&r[b.0 as usize..], &b.1, b.2);
+        for i in 0..bn {
+            f(&r[bq[i].0 as usize..], &bf[i], bq[i].1);
         }
         p = q;
     }
@@ -238,8 +231,9 @@ pub fn run_region<const NF: usize, const PRE: bool>(
         buf[..rem].copy_from_slice(&r[p..]);
         let mut q = 0usize;
         while q < rem {
-            let (l, fl) = unsafe { scan_line::<NF>(buf.as_ptr().add(q), rem - q) };
-            if let Some(fl) = fl {
+            let mut fl: Fields<NF> = [(0, 0); NF];
+            let (l, ok) = unsafe { scan_line::<NF>(buf.as_ptr().add(q), rem - q, &mut fl) };
+            if ok {
                 let uh = if PRE { hash_pre(&r[p + q + fl[1].0 as usize..p + q + fl[1].1 as usize]) } else { 0 };
                 f(&r[p + q..], &fl, uh);
             }
@@ -266,7 +260,9 @@ mod fuzz {
         let mut buf = vec![0u8; line.len() + 1 + 256];
         buf[..line.len()].copy_from_slice(line);
         buf[line.len()] = b'\n';
-        let (l, got) = unsafe { scan_line::<NF>(buf.as_ptr(), line.len() + 1) };
+        let mut fl: Fields<NF> = [(0, 0); NF];
+        let (l, ok) = unsafe { scan_line::<NF>(buf.as_ptr(), line.len() + 1, &mut fl) };
+        let got = ok.then_some(fl);
         assert_eq!(l, line.len());
         let mut f = [(0usize, 0usize); NF];
         let want = split::<NF>(line, &mut f).then(|| f.map(|(a, b)| (a as u32, b as u32)));
@@ -312,5 +308,35 @@ mod fuzz {
             }
             check::<7>(&line);
         }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// `cargo test --release bench_scan -- --ignored --nocapture` with SCAN_FILE=<events csv>
+    #[test]
+    #[ignore]
+    fn bench_scan() {
+        let Ok(path) = std::env::var("SCAN_FILE") else { return };
+        let mut v = std::fs::read(path).unwrap();
+        v.truncate(48 << 20);
+        let end = v.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+        v.truncate(end);
+        let r: &'static [u8] = Box::leak(v.into_boxed_slice());
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let (mut lines, mut sum) = (0u64, 0u64);
+            run_region::<7, false>(r, |_| 0, |_| {}, |l, f, _| {
+                lines += 1;
+                sum += (f[3].1 - f[3].0) as u64 + f[6].0 as u64 + l[0] as u64;
+            });
+            std::hint::black_box(sum);
+            let ns = t.elapsed().as_secs_f64() * 1e9 / lines as f64;
+            best = best.min(ns);
+        }
+        eprintln!("scan: {best:.1} ns/line, {} bytes/line", r.len() as f64 / r.iter().filter(|&&b| b == b'\n').count() as f64);
     }
 }
