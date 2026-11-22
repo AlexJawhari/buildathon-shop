@@ -219,6 +219,17 @@ impl Links {
         }
     }
 
+    /// Probe-only: the slot value for hash `h` without inserting (0 when absent).
+    pub fn peek(&self, h: u64) -> u64 {
+        let (mut i, mut base, mut mask, mut probes) = ((h as usize) & self.mask, 0, self.mask, 0usize);
+        loop {
+            let k = self.slots[base + i].k.load(Relaxed);
+            if k == h { return self.slots[base + i].v.load(Relaxed); }
+            if k == 0 { return 0; }
+            (i, base, mask, probes) = self.next(h, i, base, mask, probes);
+        }
+    }
+
     #[inline(always)]
     fn wait(s: &Slot) -> u32 {
         loop {

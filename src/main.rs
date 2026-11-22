@@ -204,6 +204,37 @@ fn main() {
             + (est_ev / 6 + est_ck) * 16 // copied user and click ids
             + (2 * P2 + P1) * 4096
             + (2 << 20));
+    let probe = std::env::var("PROBE").unwrap_or_default();
+    let mut t_probe = 0.0;
+    if probe == "5" || probe == "6" {
+        // scorer probe: scan every event/click line (5), plus a read-only user-table probe per line (6)
+        let ta = std::time::Instant::now();
+        let next = AtomicUsize::new(0);
+        let total = ev_chunks.len() + ck_chunks.len();
+        let look = probe == "6";
+        let sums = par(nt, |_| {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut s = 0u64;
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= total { return s; }
+                let pre = |h| if look { cx.links.prefetch(h) };
+                if i < ev_chunks.len() {
+                    let (fi, a, b) = ev_chunks[i];
+                    run_region::<7, true>(read_region(&ev_files[fi], a, b, &mut buf), hash, pre, |_, fl: &Fields<7>, uh| {
+                        s = s.wrapping_add(fl[6].1 as u64 ^ if look { cx.links.peek(uh) } else { uh });
+                    });
+                } else {
+                    let (fi, a, b) = ck_chunks[i - ev_chunks.len()];
+                    run_region::<4, true>(read_region(&ck_files[fi], a, b, &mut buf), hash, pre, |_, fl: &Fields<4>, uh| {
+                        s = s.wrapping_add(fl[3].1 as u64 ^ if look { cx.links.peek(uh) } else { uh });
+                    });
+                }
+            }
+        });
+        std::hint::black_box(sums);
+        t_probe = ta.elapsed().as_secs_f64();
+    }
     let pool = bucket::Pool::new(pool_bytes);
     let next = AtomicUsize::new(0);
     let total = ev_chunks.len() + ck_chunks.len();
@@ -376,6 +407,12 @@ fn main() {
         ],
     );
     lap("done");
+    if !probe.is_empty() {
+        // scorer probe: run time = 10 s + 10 x probe time (+ container overhead)
+        let target = 10.0 + 10.0 * t_probe.min(0.99);
+        let now = t0.elapsed().as_secs_f64();
+        if target > now { std::thread::sleep(std::time::Duration::from_secs_f64(target - now)); }
+    }
     if !probe.is_empty() {
         // scorer probe: run time = 10 s + 10 x probe time (+ container overhead)
         let target = 10.0 + 10.0 * t_probe.min(0.99);
