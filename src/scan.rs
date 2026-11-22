@@ -116,28 +116,38 @@ unsafe fn scan_line<const NF: usize>(p: *const u8, avail: usize) -> (usize, Opti
         f[i].1 = if i < NF - 1 { pos[i] } else { l as u32 };
     }
     let nq = qm0.count_ones() + qm1.count_ones();
-    if nq != 0 && !strip_quotes::<NF>(p, &mut f, nq) {
+    if nq != 0 && !strip_quotes_masks::<NF>(&mut f, cm0 as u128 | (cm1 as u128) << 64, qm0 as u128 | (qm1 as u128) << 64, l, nq) {
         return (l, None);
     }
     (l, Some(f))
 }
 
 #[inline(always)]
-unsafe fn strip_quotes<const NF: usize>(p: *const u8, f: &mut Fields<NF>, nq: u32) -> bool {
-    // branch-free: which fields start with a quote is random, so a branch per field mispredicts
-    let mut quoted = 0u32;
-    let mut bad = false;
-    for x in f.iter_mut() {
-        let (s, e) = (x.0, x.1);
-        let q = e > s && *p.add(s as usize) == b'"';
-        let li = if q { e - 1 } else { s };
-        let last = *p.add(li as usize);
-        bad |= q & ((e - s < 2) | (last != b'"'));
-        quoted += q as u32;
-        x.0 = s + q as u32;
-        x.1 = e - q as u32;
+fn pext128(x: u128, m: u128) -> u64 {
+    use std::arch::x86_64::_pext_u64;
+    unsafe { _pext_u64(x as u64, m as u64) | _pext_u64((x >> 64) as u64, (m >> 64) as u64) << (m as u64).count_ones() }
+}
+
+/// Same rule as `strip_quotes`, from the comma mask `cm` and quote mask `qm` of the line (bit i = byte i, line length
+/// `l`): a field is quoted when it starts with a quote, and then needs two or more bytes and a closing quote;
+/// the line has no other quotes.
+#[inline(always)]
+fn strip_quotes_masks<const NF: usize>(f: &mut Fields<NF>, cm: u128, qm: u128, l: usize, nq: u32) -> bool {
+    let sb = cm << 1 | 1; // first byte of each field
+    let eb = cm | 1u128 << l; // one past the last byte of each field
+    let sq = qm & sb;
+    let eq = qm << 1 & eb;
+    let sqi = pext128(sq, sb);
+    let eqi = pext128(eq, eb);
+    if nq != 2 * sq.count_ones() || sqi & !eqi != 0 || sq << 1 & eb != 0 {
+        return false;
     }
-    !bad && nq == 2 * quoted
+    for (i, x) in f.iter_mut().enumerate() {
+        let q = (sqi >> i) as u32 & 1;
+        x.0 += q;
+        x.1 -= q;
+    }
+    true
 }
 
 /// Lines with no newline in 128 bytes: find it the slow way (or take the rest of the data).
@@ -246,4 +256,61 @@ fn populate(r: &[u8]) {
     let a = r.as_ptr() as usize & !4095;
     let e = (r.as_ptr() as usize + r.len() + 4095) & !4095;
     unsafe { libc::madvise(a as *mut _, e - a, MADV_POPULATE_READ) };
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    fn check<const NF: usize>(line: &[u8]) {
+        let mut buf = vec![0u8; line.len() + 1 + 256];
+        buf[..line.len()].copy_from_slice(line);
+        buf[line.len()] = b'\n';
+        let (l, got) = unsafe { scan_line::<NF>(buf.as_ptr(), line.len() + 1) };
+        assert_eq!(l, line.len());
+        let mut f = [(0usize, 0usize); NF];
+        let want = split::<NF>(line, &mut f).then(|| f.map(|(a, b)| (a as u32, b as u32)));
+        assert_eq!(got, want, "line {:?}", String::from_utf8_lossy(line));
+    }
+
+    #[test]
+    fn scan_matches_split() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let alphabet = [b'a', b'b', b',', b'"', b'1', b'"', b','];
+        for n in 0..400_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = (x % 120) as usize;
+            let mut y = x;
+            let line: Vec<u8> = (0..len)
+                .map(|_| {
+                    y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    alphabet[(y >> 33) as usize % alphabet.len()]
+                })
+                .collect();
+            match n % 3 {
+                0 => check::<2>(&line),
+                1 => check::<4>(&line),
+                _ => check::<7>(&line),
+            }
+        }
+        // well-formed quoted lines
+        for q in 0..128u32 {
+            let mut line = Vec::new();
+            for i in 0..7 {
+                if i > 0 {
+                    line.push(b',');
+                }
+                if q >> i & 1 == 1 {
+                    line.push(b'"');
+                }
+                line.extend_from_slice(b"abcdef"[..(i % 4)].as_ref());
+                if q >> i & 1 == 1 {
+                    line.push(b'"');
+                }
+            }
+            check::<7>(&line);
+        }
+    }
 }
