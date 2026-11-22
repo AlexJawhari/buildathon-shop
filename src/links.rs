@@ -6,6 +6,8 @@
 use crate::util::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
+const SPILL: usize = 64;
+
 #[repr(C, align(16))]
 struct Slot {
     k: AtomicU64,
@@ -15,7 +17,9 @@ struct Slot {
 pub struct Links {
     slots: Box<[Slot]>,
     parent: Box<[AtomicU32]>, // 0 = root, else parent index + 1
-    mask: usize,
+    mask: usize,  // primary table: slots [0, mask]
+    cap1: usize,
+    mask2: usize, // overflow table: slots [cap1, cap1 + mask2], only touched when primary probes get long
     names: Box<[AtomicU64]>,
     npid: AtomicU32,
 }
@@ -30,10 +34,13 @@ fn zeroed<T>(n: usize) -> Box<[T]> {
 }
 
 impl Links {
-    /// `max_ids`: upper bound on distinct user IDs (links, events and clicks together).
-    pub fn new(max_ids: usize) -> Links {
-        let cap = (max_ids * 23 / 20 + 16).next_power_of_two();
-        Links { slots: zeroed(cap), parent: zeroed(cap), mask: cap - 1, names: zeroed(cap), npid: AtomicU32::new(0) }
+    /// `expect`: likely number of distinct user IDs (sizes the primary table); `max_ids`: upper bound (sizes the
+    /// overflow table, whose pages stay untouched unless the primary gets crowded).
+    pub fn new(expect: usize, max_ids: usize) -> Links {
+        let cap1 = (expect * 7 / 5 + 16).next_power_of_two();
+        let cap2 = (max_ids * 23 / 20 + 16).next_power_of_two();
+        let cap = cap1 + cap2;
+        Links { slots: zeroed(cap), parent: zeroed(cap), mask: cap1 - 1, cap1, mask2: cap2 - 1, names: zeroed(cap), npid: AtomicU32::new(0) }
     }
 
     pub fn npid(&self) -> usize {
@@ -46,25 +53,37 @@ impl Links {
 
     /// Slot of `h`, inserting it if absent; newly inserted slots are appended to `fresh`.
     fn insert(&self, h: u64, v: u64, fresh: &mut Vec<u32>) -> usize {
-        let mut i = (h as usize) & self.mask;
+        let (mut i, mut base, mut mask, mut probes) = ((h as usize) & self.mask, 0, self.mask, 0usize);
         loop {
-            let s = &self.slots[i];
+            let s = &self.slots[base + i];
             let k = s.k.load(Acquire);
             if k == h {
-                return i;
+                return base + i;
             }
             if k == 0 {
                 match s.k.compare_exchange(0, h, AcqRel, Acquire) {
                     Ok(_) => {
                         s.v.store(v, Release);
-                        fresh.push(i as u32);
-                        return i;
+                        fresh.push((base + i) as u32);
+                        return base + i;
                     }
-                    Err(cur) if cur == h => return i,
+                    Err(cur) if cur == h => return base + i,
                     Err(_) => {}
                 }
             }
-            i = (i + 1) & self.mask;
+            (i, base, mask, probes) = self.next(h, i, base, mask, probes);
+        }
+    }
+
+    /// Next probe position; after `SPILL` probes in the primary table the key moves on to the overflow table
+    /// (slots are never freed, so a key always takes the same path).
+    #[inline(always)]
+    fn next(&self, h: u64, i: usize, base: usize, mask: usize, probes: usize) -> (usize, usize, usize, usize) {
+        if base == 0 && probes + 1 >= SPILL.min(mask + 1) {
+            (h as usize & self.mask2, self.cap1, self.mask2, 0)
+        } else {
+            assert!(probes < mask, "user id table full");
+            ((i + 1) & mask, base, mask, probes + 1)
         }
     }
 
@@ -177,10 +196,9 @@ impl Links {
     /// Person id of a user id (hash `h`, bytes `name`), adding the ID as a new person when unseen.
     #[inline(always)]
     pub fn pid(&self, h: u64, name: &[u8], arena: &mut crate::bucket::Arena) -> u32 {
-        let mut i = (h as usize) & self.mask;
-        let mut probes = 0usize;
+        let (mut i, mut base, mut mask, mut probes) = ((h as usize) & self.mask, 0, self.mask, 0usize);
         loop {
-            let s = &self.slots[i];
+            let s = &self.slots[base + i];
             let k = s.k.load(Relaxed);
             if k == h {
                 return Self::wait(s);
@@ -197,9 +215,7 @@ impl Links {
                     Err(_) => {}
                 }
             }
-            i = (i + 1) & self.mask;
-            probes += 1;
-            assert!(probes <= self.mask, "user id table full");
+            (i, base, mask, probes) = self.next(h, i, base, mask, probes);
         }
     }
 

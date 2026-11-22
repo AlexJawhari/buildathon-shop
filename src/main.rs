@@ -135,7 +135,7 @@ fn main() {
     let cx = Cx {
         ws,
         we,
-        links: links::Links::new(nlines * 2 + (est_ev + est_ck) * nt / 6 + 4096),
+        links: links::Links::new(nlines * 2 + (est_ev + est_ck) * nt / 40 + 4096, nlines * 2 + (est_ev + est_ck) * nt / 6 + 4096),
         prods: pmap,
         camps: cmap,
         unknown_cat: cat_id(b"unknown"),
